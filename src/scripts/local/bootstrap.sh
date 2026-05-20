@@ -43,7 +43,8 @@ sudo apt-get install -y -qq \
   python3-venv \
   jq \
   wget \
-  imagemagick
+  imagemagick \
+  postgresql-client-common
 
 log "configuring OpenTofu apt repo"
 sudo install -m 0755 -d /etc/apt/keyrings
