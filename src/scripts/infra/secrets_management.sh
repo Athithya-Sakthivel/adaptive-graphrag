@@ -124,7 +124,7 @@ kubectl apply -f src/argo-apps/infra/reloader.yaml
 wait_for_app_synced_healthy reloader 600
 
 echo "==> Waiting for Reloader deployment"
-wait_for_deployment_available "${RELOADER_NS}" reloader 300
+wait_for_deployment_available "${RELOADER_NS}" reloader-reloader 300
 
 echo
 echo "==> Final status"

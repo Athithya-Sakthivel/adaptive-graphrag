@@ -7,7 +7,7 @@ aws ssm put-parameter \
 
 aws ssm put-parameter \
     --name "/autonomous-incident-responder/tool-server/api-key" \
-    --value "$(openssl rand -hex 32)" \  # Generate random key
+    --value "$(openssl rand -hex 32)" \ 
     --type "SecureString" \
     --region ap-south-1 \
     --overwrite
