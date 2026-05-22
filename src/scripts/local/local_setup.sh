@@ -103,7 +103,7 @@ bash src/scripts/infra/argo_setup.sh --rollout
 kubectl create ns external-secrets || true
 
 echo "==> Creating aws-creds secret required by ESO controller"
-kubectl -n external-secrets create secret generic aws-creds \
+kubectl -n external-secrets-system create secret generic aws-creds \
   --from-literal=access-key-id="${AWS_ACCESS_KEY_ID}" \
   --from-literal=secret-access-key="${AWS_SECRET_ACCESS_KEY}" \
   --from-literal=session-token="${AWS_SESSION_TOKEN:-}" \
@@ -111,3 +111,5 @@ kubectl -n external-secrets create secret generic aws-creds \
   --dry-run=client -o yaml | kubectl apply -f -
   
 bash src/scripts/infra/secrets_management.sh
+
+kubectl apply -f src/argo-apps/observability/signoz-application.yaml

@@ -3,8 +3,6 @@ kind: Application
 metadata:
   name: external-secrets
   namespace: argocd
-  annotations:
-    argocd.argoproj.io/sync-wave: "0"
 spec:
   project: default
 
@@ -64,4 +62,3 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
-      - SkipDryRunOnMissingResource=true
