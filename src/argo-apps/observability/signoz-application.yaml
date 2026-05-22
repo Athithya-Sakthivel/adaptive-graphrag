@@ -48,14 +48,14 @@ spec:
                 memory: "1Gi"
               limits:
                 cpu: "1"
-                memory: "2Gi"
+                memory: "1Gi"
           resources:
             requests:
               cpu: "1"
-              memory: "2Gi"
+              memory: "1Gi"
             limits:
               cpu: "2"
-              memory: "4Gi"
+              memory: "2Gi"
           securityContext:
             enabled: true
             runAsUser: 101
