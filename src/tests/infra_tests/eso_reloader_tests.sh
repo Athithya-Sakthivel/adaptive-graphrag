@@ -118,12 +118,12 @@ log "  Secret: ${SECRET_VALUE:0:12}..."
 # ─── TEST 2: Deploy Test App with Reloader Annotation ────────────────────────
 echo -e "\n${YELLOW}--- Test 2: Deploy Test App with Reloader Annotation ---${NC}"
 
-cat <<EOF | kubectl apply -f -
+cat <<'EOF' | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: test-app
-  namespace: $TEST_NAMESPACE
+  namespace: eso-reloader-test
   annotations:
     secret.reloader.stakater.com/reload: "test-api-key"
   labels:
@@ -140,7 +140,7 @@ spec:
     spec:
       containers:
       - name: app
-        image: nginx:alpine
+        image: nginx:alpine@sha256:2f07d83bf561b506400dc183b1b2003803e39efbd22451f848adaba14d28c7c7
         env:
         - name: API_KEY
           valueFrom:
@@ -253,5 +253,6 @@ if [ "$FAIL" -gt 0 ]; then
     exit 1
 else
     echo -e "\n${GREEN}All $PASS tests passed.${NC}"
-    kubectl delete namespace eso-reloader-test
+    echo -e "Namespace ${YELLOW}$TEST_NAMESPACE${NC} kept for inspection."
+    echo -e "Delete with: ${YELLOW}kubectl delete namespace $TEST_NAMESPACE${NC}"
 fi
