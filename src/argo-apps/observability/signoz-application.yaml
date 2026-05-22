@@ -13,7 +13,7 @@ spec:
   source:
     repoURL: https://github.com/Athithya-Sakthivel/archived-helm-charts.git
     targetRevision: main
-    path: signoz-patched # Points to the patched chart
+    path: signoz-patched # Points to your patched chart
     helm:
       values: |
         global:
@@ -35,16 +35,11 @@ spec:
           # --- External Secret Configuration ---
           existingSecret: "signoz-clickhouse-credentials"
           existingSecretKey: "admin-password"
+          layout:
+            shardsCount: 1
+            replicasCount: 1
           zookeeper:
             enabled: false
-            replicaCount: 1
-            resources:
-              requests:
-                cpu: "500m"
-                memory: "1Gi"
-              limits:
-                cpu: "1"
-                memory: "1Gi"
           resources:
             requests:
               cpu: "1"
@@ -69,6 +64,9 @@ spec:
             enabled: true
             udf:
               enabled: true
+        
+        telemetryStoreMigrator:
+          enableReplication: false
         
         signoz:
           name: "signoz"
