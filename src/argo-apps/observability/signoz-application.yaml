@@ -35,10 +35,6 @@ spec:
           # --- External Secret Configuration ---
           existingSecret: "signoz-clickhouse-credentials"
           existingSecretKey: "admin-password"
-          # ----------------------------------
-          layout:
-            shardsCount: 1
-            replicasCount: 1
           zookeeper:
             enabled: false
             replicaCount: 1

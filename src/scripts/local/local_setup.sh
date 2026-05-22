@@ -76,11 +76,10 @@ fi
 
 kubectl label node k3s-local node-type=compute
 
-bash src/infra/core/default_storage_class.sh k3s 
-
 sudo k3s kubectl config view --raw > ~/.kube/config
 chmod 600 ~/.kube/config
 export KUBECONFIG=$HOME/.kube/config
+source ~/.bashrc
 
 # ============================================================================
 # 5. DONE
@@ -100,7 +99,10 @@ echo "  source ~/.bashrc"
 
 bash src/scripts/infra/argo_setup.sh --rollout
 
-kubectl create ns external-secrets || true
+bash src/scripts/infra/default_storage_class.sh k3s
+
+kubectl create ns external-secrets-system || true
+
 
 echo "==> Creating aws-creds secret required by ESO controller"
 kubectl -n external-secrets-system create secret generic aws-creds \
@@ -110,6 +112,8 @@ kubectl -n external-secrets-system create secret generic aws-creds \
   --from-literal=region="${AWS_REGION}" \
   --dry-run=client -o yaml | kubectl apply -f -
   
+sleep 3
+
 bash src/scripts/infra/secrets_management.sh
 
 kubectl apply -f src/argo-apps/observability/signoz-application.yaml

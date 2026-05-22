@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ARGO_NS="argocd"
-ESO_NS="external-secrets"
+ESO_NS="external-secrets-system"
 RELOADER_NS="reloader"
 
 wait_for_app_synced_healthy() {
@@ -107,8 +107,9 @@ kubectl api-resources | grep external-secrets.io >/dev/null
 echo "==> Phase 4: ClusterSecretStore via ArgoCD"
 kubectl apply -f src/argo-apps/infra/cluster-secret-store.yaml
 
-echo "==> Waiting for ArgoCD application: cluster-secret-store to exist"
-until kubectl get application cluster-secret-store -n "${ARGO_NS}" >/dev/null 2>&1; do
+# Line in Phase 4
+echo "==> Waiting for ArgoCD application: external-secrets-stores to exist"
+until kubectl get application external-secrets-stores -n "${ARGO_NS}" >/dev/null 2>&1; do
   sleep 2
 done
 
@@ -116,8 +117,6 @@ echo "==> Waiting for ClusterSecretStore resource to appear"
 until kubectl get clustersecretstore cluster-secret-store >/dev/null 2>&1; do
   sleep 2
 done
-
-wait_for_clustersecretstore cluster-secret-store 600
 
 echo "==> Applying Reloader via ArgoCD"
 kubectl apply -f src/argo-apps/infra/reloader.yaml
