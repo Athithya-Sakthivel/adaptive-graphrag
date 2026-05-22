@@ -1,11 +1,13 @@
-# src/argo-apps/infra/eso.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: external-secrets
   namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
 spec:
   project: default
+
   source:
     repoURL: https://charts.external-secrets.io
     chart: external-secrets
@@ -16,9 +18,7 @@ spec:
 
         serviceAccount:
           create: true
-          name: eso-sa
 
-        # ESO chart uses extraEnv for container env injection.
         extraEnv:
           - name: AWS_ACCESS_KEY_ID
             valueFrom:
@@ -55,7 +55,7 @@ spec:
 
   destination:
     server: https://kubernetes.default.svc
-    namespace: external-secrets
+    namespace: external-secrets-system
 
   syncPolicy:
     automated:
