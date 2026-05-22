@@ -21,13 +21,13 @@ jobs:
   scan-and-mirror:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       packages: write
 
     strategy:
       fail-fast: false
       matrix:
         image:
-          # SigNoz images
           - source: docker.io/signoz/signoz:v0.118.0
             name: signoz
             patch: true
@@ -56,11 +56,9 @@ jobs:
           - source: docker.io/busybox:1.35
             name: busybox
             patch: false
-          # External Secrets Operator
           - source: ghcr.io/external-secrets/external-secrets:v2.5.0
             name: external-secrets
             patch: false
-          # Reloader
           - source: ghcr.io/stakater/reloader:v1.4.16
             name: reloader
             patch: false
@@ -80,10 +78,16 @@ jobs:
           NAME="${{ matrix.image.name }}"
           TAG="${SOURCE##*:}"
           OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          GHCR_IMAGE="ghcr.io/${OWNER_LOWER}/${NAME}:${TAG}"
+          if [ "${{ matrix.image.patch }}" = "true" ]; then
+            TARGET_TAG="${TAG}-patched"
+          else
+            TARGET_TAG="${TAG}"
+          fi
+          GHCR_IMAGE="ghcr.io/${OWNER_LOWER}/${NAME}:${TARGET_TAG}"
           echo "name=${NAME}" >> $GITHUB_OUTPUT
           echo "source=${SOURCE}" >> $GITHUB_OUTPUT
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "target_tag=${TARGET_TAG}" >> $GITHUB_OUTPUT
           echo "ghcr_image=${GHCR_IMAGE}" >> $GITHUB_OUTPUT
           echo "patch=${{ matrix.image.patch }}" >> $GITHUB_OUTPUT
           echo "patch_cmd=${{ matrix.image.patch_cmd }}" >> $GITHUB_OUTPUT
@@ -91,39 +95,29 @@ jobs:
           echo "SOURCE: ${SOURCE}"
           echo "TARGET: ${GHCR_IMAGE}"
 
-      - name: Build patched image (if OS fixes available)
+      - name: Build patched image
         id: patch
         if: matrix.image.patch == true
         run: |
-          PATCHED_TAG="${{ steps.parse.outputs.tag }}-patched"
-          PATCHED_IMAGE="ghcr.io/$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')/${{ steps.parse.outputs.name }}:${PATCHED_TAG}"
-          echo "Building patched image: ${PATCHED_IMAGE}"
-          cat > Dockerfile.patch <<EOF
+          echo "Building patched image: ${{ steps.parse.outputs.ghcr_image }}"
+          cat > /tmp/Dockerfile.patch <<'DOCKERFILE'
           FROM ${{ steps.parse.outputs.source }}
           RUN ${{ steps.parse.outputs.patch_cmd }}
-          EOF
-          docker build -t "${PATCHED_IMAGE}" -f Dockerfile.patch .
-          echo "patched_image=${PATCHED_IMAGE}" >> $GITHUB_OUTPUT
+          DOCKERFILE
+          docker build -t "${{ steps.parse.outputs.ghcr_image }}" -f /tmp/Dockerfile.patch .
 
-      - name: Set image to scan and push
-        id: target
-        run: |
-          if [ "${{ steps.parse.outputs.patch }}" = "true" ]; then
-            echo "image=${{ steps.patch.outputs.patched_image }}" >> $GITHUB_OUTPUT
-          else
-            echo "image=${{ steps.parse.outputs.source }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Pull image (if not built locally)
+      - name: Pull and tag unpatched image
         if: matrix.image.patch != true
         run: |
           echo "Pulling: ${{ steps.parse.outputs.source }}"
-          docker pull ${{ steps.parse.outputs.source }}
+          docker pull "${{ steps.parse.outputs.source }}"
+          echo "Tagging for GHCR: ${{ steps.parse.outputs.ghcr_image }}"
+          docker tag "${{ steps.parse.outputs.source }}" "${{ steps.parse.outputs.ghcr_image }}"
 
       - name: Scan with Trivy
         continue-on-error: true
         run: |
-          IMAGE="${{ steps.target.outputs.image }}"
+          IMAGE="${{ steps.parse.outputs.ghcr_image }}"
           echo "Scanning: ${IMAGE}"
           echo "Severity threshold: ${{ github.event.inputs.severity || 'CRITICAL' }}"
           docker run --rm \
@@ -137,14 +131,14 @@ jobs:
             "${IMAGE}"
           echo "Scan complete: ${IMAGE}"
 
-      - name: Tag and push to GHCR
+      - name: Push to GHCR
         run: |
-          IMAGE="${{ steps.target.outputs.image }}"
+          IMAGE="${{ steps.parse.outputs.ghcr_image }}"
           echo "Pushing: ${IMAGE}"
           docker push "${IMAGE}"
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}")
+          echo ""
           echo "MIRRORED: ${IMAGE}@${DIGEST##*@}"
-          echo "digest=${DIGEST##*@}" >> $GITHUB_OUTPUT
 
   summary:
     needs: scan-and-mirror
@@ -160,17 +154,17 @@ jobs:
           echo "  Registry: ghcr.io/${OWNER_LOWER}"
           echo "======================================================================"
           echo ""
-          echo "SigNoz (patched where OS fixes possible):"
+          echo "Patched images (OS CVEs fixed):"
           echo "  ghcr.io/${OWNER_LOWER}/signoz:v0.118.0-patched"
           echo "  ghcr.io/${OWNER_LOWER}/signoz-otel-collector:v0.144.2-patched"
           echo "  ghcr.io/${OWNER_LOWER}/zookeeper:3.7.1-patched"
           echo "  ghcr.io/${OWNER_LOWER}/alpine:3.18.2-patched"
           echo ""
-          echo "SigNoz (unchanged, Go CVEs only, unfixed ignored):"
+          echo "Unchanged images (Go CVEs only, unfixed ignored):"
           echo "  ghcr.io/${OWNER_LOWER}/clickhouse-operator:0.21.2"
           echo "  ghcr.io/${OWNER_LOWER}/metrics-exporter:0.21.2"
           echo ""
-          echo "SigNoz (no CVEs):"
+          echo "Clean images (no CVEs):"
           echo "  ghcr.io/${OWNER_LOWER}/clickhouse-server:25.5.6"
           echo "  ghcr.io/${OWNER_LOWER}/busybox:1.35"
           echo ""
@@ -178,6 +172,5 @@ jobs:
           echo "  ghcr.io/${OWNER_LOWER}/external-secrets:v2.5.0"
           echo "  ghcr.io/${OWNER_LOWER}/reloader:v1.4.16"
           echo ""
-          echo "Usage with digest (add @sha256:<digest> from job logs):"
-          echo "  docker pull ghcr.io/${OWNER_LOWER}/signoz:v0.118.0-patched"
+          echo "Usage: docker pull ghcr.io/${OWNER_LOWER}/signoz:v0.118.0-patched"
           echo "======================================================================"
