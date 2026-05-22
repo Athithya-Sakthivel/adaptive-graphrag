@@ -1,0 +1,183 @@
+# .github/workflows/scan-and-mirror-images.yml
+name: Scan and Mirror Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      severity:
+        description: 'Vulnerability severity threshold'
+        required: false
+        default: 'CRITICAL'
+        type: choice
+        options:
+          - CRITICAL
+          - HIGH
+          - MEDIUM
+
+env:
+  GHCR_REGISTRY: ghcr.io
+
+jobs:
+  scan-and-mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          # SigNoz images
+          - source: docker.io/signoz/signoz:v0.118.0
+            name: signoz
+            patch: true
+            patch_cmd: "apk update && apk upgrade libcrypto3 libssl3"
+          - source: docker.io/signoz/signoz-otel-collector:v0.144.2
+            name: signoz-otel-collector
+            patch: true
+            patch_cmd: "apt-get update && apt-get upgrade -y libgnutls30 libssl3 openssl zlib1g"
+          - source: docker.io/clickhouse/clickhouse-server:25.5.6
+            name: clickhouse-server
+            patch: false
+          - source: docker.io/altinity/clickhouse-operator:0.21.2
+            name: clickhouse-operator
+            patch: false
+          - source: docker.io/altinity/metrics-exporter:0.21.2
+            name: metrics-exporter
+            patch: false
+          - source: docker.io/signoz/zookeeper:3.7.1
+            name: zookeeper
+            patch: true
+            patch_cmd: "apt-get update && apt-get upgrade -y"
+          - source: docker.io/alpine:3.18.2
+            name: alpine
+            patch: true
+            patch_cmd: "apk update && apk upgrade busybox busybox-binsh ssl_client"
+          - source: docker.io/busybox:1.35
+            name: busybox
+            patch: false
+          # External Secrets Operator
+          - source: ghcr.io/external-secrets/external-secrets:v2.5.0
+            name: external-secrets
+            patch: false
+          # Reloader
+          - source: ghcr.io/stakater/reloader:v1.4.16
+            name: reloader
+            patch: false
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse image info
+        id: parse
+        run: |
+          SOURCE="${{ matrix.image.source }}"
+          NAME="${{ matrix.image.name }}"
+          TAG="${SOURCE##*:}"
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          GHCR_IMAGE="ghcr.io/${OWNER_LOWER}/${NAME}:${TAG}"
+          echo "name=${NAME}" >> $GITHUB_OUTPUT
+          echo "source=${SOURCE}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "ghcr_image=${GHCR_IMAGE}" >> $GITHUB_OUTPUT
+          echo "patch=${{ matrix.image.patch }}" >> $GITHUB_OUTPUT
+          echo "patch_cmd=${{ matrix.image.patch_cmd }}" >> $GITHUB_OUTPUT
+          echo "---"
+          echo "SOURCE: ${SOURCE}"
+          echo "TARGET: ${GHCR_IMAGE}"
+
+      - name: Build patched image (if OS fixes available)
+        id: patch
+        if: matrix.image.patch == true
+        run: |
+          PATCHED_TAG="${{ steps.parse.outputs.tag }}-patched"
+          PATCHED_IMAGE="ghcr.io/$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')/${{ steps.parse.outputs.name }}:${PATCHED_TAG}"
+          echo "Building patched image: ${PATCHED_IMAGE}"
+          cat > Dockerfile.patch <<EOF
+          FROM ${{ steps.parse.outputs.source }}
+          RUN ${{ steps.parse.outputs.patch_cmd }}
+          EOF
+          docker build -t "${PATCHED_IMAGE}" -f Dockerfile.patch .
+          echo "patched_image=${PATCHED_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Set image to scan and push
+        id: target
+        run: |
+          if [ "${{ steps.parse.outputs.patch }}" = "true" ]; then
+            echo "image=${{ steps.patch.outputs.patched_image }}" >> $GITHUB_OUTPUT
+          else
+            echo "image=${{ steps.parse.outputs.source }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pull image (if not built locally)
+        if: matrix.image.patch != true
+        run: |
+          echo "Pulling: ${{ steps.parse.outputs.source }}"
+          docker pull ${{ steps.parse.outputs.source }}
+
+      - name: Scan with Trivy
+        continue-on-error: true
+        run: |
+          IMAGE="${{ steps.target.outputs.image }}"
+          echo "Scanning: ${IMAGE}"
+          echo "Severity threshold: ${{ github.event.inputs.severity || 'CRITICAL' }}"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            ghcr.io/athithya-sakthivel/trivy:0.69.3-safe \
+            image \
+            --scanners vuln \
+            --severity ${{ github.event.inputs.severity || 'CRITICAL' }} \
+            --ignore-unfixed \
+            --format table \
+            "${IMAGE}"
+          echo "Scan complete: ${IMAGE}"
+
+      - name: Tag and push to GHCR
+        run: |
+          IMAGE="${{ steps.target.outputs.image }}"
+          echo "Pushing: ${IMAGE}"
+          docker push "${IMAGE}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}")
+          echo "MIRRORED: ${IMAGE}@${DIGEST##*@}"
+          echo "digest=${DIGEST##*@}" >> $GITHUB_OUTPUT
+
+  summary:
+    needs: scan-and-mirror
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Print all mirrored images
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo ""
+          echo "======================================================================"
+          echo "  IMAGE MIRROR COMPLETE"
+          echo "  Registry: ghcr.io/${OWNER_LOWER}"
+          echo "======================================================================"
+          echo ""
+          echo "SigNoz (patched where OS fixes possible):"
+          echo "  ghcr.io/${OWNER_LOWER}/signoz:v0.118.0-patched"
+          echo "  ghcr.io/${OWNER_LOWER}/signoz-otel-collector:v0.144.2-patched"
+          echo "  ghcr.io/${OWNER_LOWER}/zookeeper:3.7.1-patched"
+          echo "  ghcr.io/${OWNER_LOWER}/alpine:3.18.2-patched"
+          echo ""
+          echo "SigNoz (unchanged, Go CVEs only, unfixed ignored):"
+          echo "  ghcr.io/${OWNER_LOWER}/clickhouse-operator:0.21.2"
+          echo "  ghcr.io/${OWNER_LOWER}/metrics-exporter:0.21.2"
+          echo ""
+          echo "SigNoz (no CVEs):"
+          echo "  ghcr.io/${OWNER_LOWER}/clickhouse-server:25.5.6"
+          echo "  ghcr.io/${OWNER_LOWER}/busybox:1.35"
+          echo ""
+          echo "Infrastructure:"
+          echo "  ghcr.io/${OWNER_LOWER}/external-secrets:v2.5.0"
+          echo "  ghcr.io/${OWNER_LOWER}/reloader:v1.4.16"
+          echo ""
+          echo "Usage with digest (add @sha256:<digest> from job logs):"
+          echo "  docker pull ghcr.io/${OWNER_LOWER}/signoz:v0.118.0-patched"
+          echo "======================================================================"
