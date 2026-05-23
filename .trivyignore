@@ -1,0 +1,6 @@
+
+
+
+# fastembed docker images
+CVE-2026-33845 # Debian GnuTLS DTLS vulnerability - app does not use DTLS, temporary until 3.8.13-1 reaches stable
+

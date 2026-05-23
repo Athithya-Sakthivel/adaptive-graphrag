@@ -1,0 +1,7 @@
+tunnel: tabular-api-tunnel
+ingress:
+- hostname: auth.athithya.site
+  service: http://auth-svc.inference.svc.cluster.local:80
+- hostname: predict.athithya.site
+  service: http://tabular-inference-serve-svc.inference.svc.cluster.local:8000
+- service: http_status:404
