@@ -1,0 +1,64 @@
+# src/manifests/signoz/argo-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: signoz
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Athithya-Sakthivel/archived-helm-charts.git
+    targetRevision: main
+    path: signoz-patched
+    helm:
+      values: |
+        global:
+          storageClass: "default-storage-class"
+          clusterName: "prod-eks"
+          cloud: "aws"
+        clickhouse:
+          enabled: true
+          user: "admin"
+          existingSecret: "signoz-clickhouse-credentials"
+          existingSecretKey: "admin-password"
+          layout:
+            shardsCount: 1
+            replicasCount: 1
+          zookeeper:
+            enabled: true          
+            replicaCount: 1
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          persistence:
+            size: "20Gi"
+            storageClass: "default-storage-class"
+        signoz:
+          replicaCount: 1
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "500Mi"
+            limits:
+              cpu: "2"
+              memory: "1.5Gi"
+          persistence:
+            size: "10Gi"
+            storageClass: "default-storage-class"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: signoz
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
