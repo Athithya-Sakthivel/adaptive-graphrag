@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dense
+  namespace: inference
+  labels: &labels
+    app.kubernetes.io/name: dense
+    app.kubernetes.io/component: embedding
+    app.kubernetes.io/part-of: ticket-triage-agent
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dense
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      serviceAccountName: dense-sa
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: dense
+          image: ghcr.io/athithya-sakthivel/dense:2026-05-23-10-39--a111196@sha256:1aac0f4036d883a3ca9dba9d83a1f57ff6d5fc1fe5ea34861372bb48d5885d51
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8200
+              name: http
+              protocol: TCP
+          env:
+            # Service identity
+            - name: OTEL_SERVICE_NAME
+              value: dense-embedder
+            - name: SERVICE_VERSION
+              value: "0.1.0"
+            - name: DEPLOYMENT_ENVIRONMENT
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+            # OTel export → SigNoz OTel Collector
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://signoz-otel-collector.signoz.svc.cluster.local:4317
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_LOG_LEVEL
+              value: INFO
+            - name: OTEL_METRIC_EXPORT_INTERVAL_MS
+              value: "60000"
+            - name: OTEL_METRIC_EXPORT_TIMEOUT_MS
+              value: "30000"
+
+            # Model configuration
+            - name: DENSE_MODEL_NAME
+              value: BAAI/bge-small-en-v1.5
+            - name: DENSE_DIM
+              value: "384"
+            - name: DENSE_BATCH_SIZE
+              value: "32"
+            - name: DENSE_NORMALIZE
+              value: "TRUE"
+            - name: DENSE_CUDA
+              value: "0"
+            - name: PRELOAD_MODEL
+              value: "1"
+
+            # Server
+            - name: DENSE_HOST
+              value: "0.0.0.0"
+            - name: DENSE_PORT
+              value: "8200"
+            - name: UVICORN_WORKERS
+              value: "1"
+
+            # Threading
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OPENBLAS_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+            - name: ORT_NUM_THREADS
+              value: "1"
+
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 8200
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8200
+            initialDelaySeconds: 0
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8200
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: models-cache
+              mountPath: /models_cache
+
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        - name: models-cache
+          emptyDir:
+            sizeLimit: 1Gi
