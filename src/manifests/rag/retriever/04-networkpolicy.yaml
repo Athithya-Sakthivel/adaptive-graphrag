@@ -1,0 +1,68 @@
+# 05-networkpolicy.yaml – least‑privilege network rules
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: retriever-minimal
+  namespace: inference
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: retriever-minimal
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from frontend or API gateway (adjust label as needed)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: inference
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+      ports:
+        - port: 8001
+          protocol: TCP
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # SigNoz OTel Collector (gRPC)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: signoz
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: otel-collector
+              app.kubernetes.io/name: signoz
+      ports:
+        - port: 4317
+          protocol: TCP
+    # Dense embedding service (same namespace)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: dense
+      ports:
+        - port: 8200
+          protocol: TCP
+    # Qdrant (in qdrant namespace)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: qdrant
+          podSelector:
+            matchLabels:
+              app: qdrant
+      ports:
+        - port: 6333
+          protocol: TCP

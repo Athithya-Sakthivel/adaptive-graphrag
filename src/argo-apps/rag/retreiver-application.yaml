@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: retriever
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"   # after qdrant 
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Athithya-Sakthivel/ticket-triage-agent.git
+    targetRevision: main
+    path: src/manifests/rag/retriever
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: inference
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
