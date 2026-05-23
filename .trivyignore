@@ -1,6 +1,21 @@
+# indexing pipeline
+AVD-DS-0031  # TOKEN_* vars are non-sensitive tokenizer identifiers (false positive)
+CVE-2026-40962 # Integer overflow and out-of-bounds(no longer performing audio conversions with ffmpeg)
 
+# retriever
+KSV-0109 # False positive: `LLM_MAX_TOKENS` is a non-sensitive numeric config, not a secret
 
+# terraform
+AWS-0132 # Ignores “bucket does not encrypt data with a customer managed key” rule as its not required.
 
 # fastembed docker images
 CVE-2026-33845 # Debian GnuTLS DTLS vulnerability - app does not use DTLS, temporary until 3.8.13-1 reaches stable
 
+# Private SSM-only EKS admin host requires outbound HTTPS/DNS
+# for EKS API, S3, STS, ECR, SSM, kubectl download, and package repos.
+# Instance has:
+# - no public IP
+# - no inbound rules
+# - private subnet only
+# - NAT-only outbound
+AVD-AWS-0104

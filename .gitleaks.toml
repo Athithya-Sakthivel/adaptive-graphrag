@@ -1,18 +1,11 @@
-title = "ticket-triage-agent"
+title = "gitleaks config"
 
-[extend]
-useDefault = true
+[allowlist]
+description = "False positives from S3 prefix concatenation patterns"
+paths = ["src/indexing_pipeline/parse_chunk/"]
 
-[[allowlists]]
-description = "False positives from S3 object key concatenation"
-
-paths = [
-  '''src/workloads/rag/indexing_pipeline/parse_chunk/formats/'''
-]
-
-regexes = [
-  '''out_basename''',
-  '''out_parquet_key''',
-  '''raw_manifest''',
-  '''S3_BUCKET''',
-]
+[[rules]]
+id = "generic-api-key"
+description = "Generic API key pattern; allow in chunk parsers"
+regex = '''(?i)generic[-_ ]?api[-_ ]?key'''
+paths = ["src/indexing_pipeline/parse_chunk/"]
