@@ -44,7 +44,8 @@ sudo apt-get install -y -qq \
   jq \
   wget \
   imagemagick \
-  postgresql-client-common
+  postgresql-client-common \
+  postgresql-client
 
 log "configuring OpenTofu apt repo"
 sudo install -m 0755 -d /etc/apt/keyrings

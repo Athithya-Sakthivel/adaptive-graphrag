@@ -3,12 +3,12 @@
 # Works for both kind and EKS.
 #
 # Commands:
-#   bash src/infra/core/postgres_cluster.sh deploy
-#   bash src/infra/core/postgres_cluster.sh backup --wait
-#   bash src/infra/core/postgres_cluster.sh deploy --restore latest --force-recreate
-#   bash src/infra/core/postgres_cluster.sh deploy --restore time --target-time <RFC3339> --force-recreate
-#   bash src/infra/core/postgres_cluster.sh destroy
-#   bash src/infra/core/postgres_cluster.sh status
+#   bash src/scripts/infra/postgres_cluster.sh deploy
+#   bash src/scripts/infra/postgres_cluster.sh backup --wait
+#   bash src/scripts/infra/postgres_cluster.sh deploy --restore latest --force-recreate
+#   bash src/scripts/infra/postgres_cluster.sh deploy --restore time --target-time <RFC3339> --force-recreate
+#   bash src/scripts/infra/postgres_cluster.sh destroy
+#   bash src/scripts/infra/postgres_cluster.sh status
 #
 # Stable identity:
 #   PG_CLUSTER_ID              S3 namespace / environment scope
