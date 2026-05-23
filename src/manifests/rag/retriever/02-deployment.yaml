@@ -27,8 +27,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: retriever-minimal
-          # Replace with your built image tag/digest
-          image: ghcr.io/athithya-sakthivel/retriever:2026-05-23-12-08--d39ee66@sha256:797a3773345a474cf571ddf3a8499ba52f5fc037a6326980b452b1ee62b8c010
+          image: ghcr.io/athithya-sakthivel/retriever:2026-05-23-12-43--6619b09@sha256:4cc4926f3e184233c4ee11ebace6079d7aac03edae7c35c7262f09aed609b67c
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8001
