@@ -28,7 +28,7 @@ spec:
       containers:
         - name: retriever-minimal
           image: ghcr.io/athithya-sakthivel/retriever:2026-05-23-12-43--6619b09@sha256:4cc4926f3e184233c4ee11ebace6079d7aac03edae7c35c7262f09aed609b67c
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8001
               name: http
@@ -62,7 +62,7 @@ spec:
             - name: QDRANT_URL
               value: http://qdrant.qdrant.svc.cluster.local:6333
             - name: COLLECTION_NAME
-              value: documents
+              value: kestral_policies
             - name: DENSE_DIM
               value: "384"
             - name: TOP_K

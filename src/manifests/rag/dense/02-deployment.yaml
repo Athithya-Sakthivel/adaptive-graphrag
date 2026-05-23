@@ -27,7 +27,7 @@ spec:
       containers:
         - name: dense
           image: ghcr.io/athithya-sakthivel/dense:2026-05-23-13-13--0df319e@sha256:e65b567781bc3e26be296f5c197b40cffdbb4509f8a144690c5d6b4d7f226d3f
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always 
           ports:
             - containerPort: 8200
               name: http
