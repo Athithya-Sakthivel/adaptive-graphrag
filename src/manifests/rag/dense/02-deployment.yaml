@@ -26,7 +26,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: dense
-          image: ghcr.io/athithya-sakthivel/dense:2026-05-23-13-13--0df319e@sha256:e65b567781bc3e26be296f5c197b40cffdbb4509f8a144690c5d6b4d7f226d3f
+          image: ghcr.io/athithya-sakthivel/dense:2026-05-24-15-46--7d4606f@sha256:a7640381fe34ff05e0915c15c6452e138a1d24bd18b85c9717972dce3e871954
           imagePullPolicy: Always
           ports:
             - containerPort: 8200
