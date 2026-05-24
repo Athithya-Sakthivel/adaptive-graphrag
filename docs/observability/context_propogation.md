@@ -126,4 +126,4 @@ When adding a service, update this matrix with:
 2. Whether each call is business logic (propagate) or health check (do not propagate)
 3. The method used (manual `inject()` or framework auto-propagation)
 
-See `onboarding.md` for the complete checklist.
+See `onboarding.md` for the complete checklist
