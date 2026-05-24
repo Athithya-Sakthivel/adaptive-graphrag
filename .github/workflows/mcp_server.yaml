@@ -1,0 +1,95 @@
+name: mcp-server-image-ci
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - src/workloads/mcp-server/**
+  pull_request:
+    paths:
+      - src/workloads/mcp-server/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-server-image-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TRIVY_IMAGE: ghcr.io/athithya-sakthivel/trivy:0.69.3-safe@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
+  TRIVY_CACHE_DIR: ${{ github.workspace }}/.trivy-cache
+
+jobs:
+  build-scan-push:
+    name: Build, scan, publish mcp-server image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: staging
+
+    env:
+      GIT_PAT: ${{ secrets.GIT_PAT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Restore Trivy cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-${{ runner.os }}-
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          GHCR_USER="$(printf '%s' '${{ github.actor }}' | tr '[:upper:]' '[:lower:]')"
+          TAG="$(TZ=Asia/Kolkata date +%Y-%m-%d-%H-%M)--$(git rev-parse --short HEAD)"
+          echo "ghcr_user=${GHCR_USER}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GHCR_USER}/mcp-server:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "staging=ghcr.io/${GHCR_USER}/mcp-server:staging" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: src/workloads/mcp-server
+          file: src/workloads/mcp-server/Dockerfile
+          load: true
+          push: false
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.staging }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Scan with Trivy
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
+            -v "$PWD:/workspace" -w /workspace \
+            "${TRIVY_IMAGE}" image \
+            --cache-dir /root/.cache/trivy \
+            --scanners vuln \
+            --severity CRITICAL \
+            --exit-code 1 \
+            "${{ steps.build.outputs.imageid }}"
+
+      - name: Login to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ steps.meta.outputs.ghcr_user }}
+          password: ${{ env.GIT_PAT }}
+
+      - name: Push images
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "${{ steps.meta.outputs.image }}"
+          docker push "${{ steps.meta.outputs.staging }}"

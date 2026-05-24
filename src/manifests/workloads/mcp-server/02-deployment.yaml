@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+  namespace: inference
+  labels: &labels
+    app.kubernetes.io/name: mcp-server
+    app.kubernetes.io/component: mcp
+    app.kubernetes.io/part-of: ticket-triage-agent
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      serviceAccountName: mcp-server-sa
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: mcp-server
+          image: ghcr.io/athithya-sakthivel/mcp-server:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+              name: http
+              protocol: TCP
+          env:
+            # Service identity
+            - name: OTEL_SERVICE_NAME
+              value: mcp-server
+            - name: SERVICE_VERSION
+              value: "0.1.0"
+            - name: DEPLOYMENT_ENVIRONMENT
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LOG_LEVEL
+              value: "INFO"
+
+            # OTel export → SigNoz OTel Collector
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://signoz-otel-collector.signoz.svc.cluster.local:4317
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
+            - name: OTEL_LOG_LEVEL
+              value: INFO
+            - name: OTEL_METRIC_EXPORT_INTERVAL_MS
+              value: "60000"
+            - name: OTEL_METRIC_EXPORT_TIMEOUT_MS
+              value: "30000"
+
+            # PostgreSQL (read + write)
+            - name: DATABASE_URL
+              value: postgresql://app:password@postgres-pooler.default.svc.cluster.local:5432/agents_state
+            - name: POOL_MIN_SIZE
+              value: "5"
+            - name: POOL_MAX_SIZE
+              value: "25"
+
+            # Dense embedding service
+            - name: DENSE_URL
+              value: http://dense-svc.inference.svc.cluster.local:8200
+
+            # Qdrant
+            - name: QDRANT_URL
+              value: http://qdrant.qdrant.svc.cluster.local:6333
+            - name: QDRANT_COLLECTION
+              value: kestral_policies
+            - name: EMBEDDING_MODEL
+              value: BAAI/bge-small-en-v1.5
+
+            # Retriever (not directly called by mcp-server, but available)
+            - name: RETRIEVER_URL
+              value: http://retriever-minimal-svc.inference.svc.cluster.local:8001
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8001
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8001
+            initialDelaySeconds: 0
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8001
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi

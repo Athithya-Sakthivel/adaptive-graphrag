@@ -1,4 +1,4 @@
-# src/manifests/signoz/argo-app.yaml
+# src/argo-apps/observability/signoz-application.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -20,6 +20,7 @@ spec:
           storageClass: "default-storage-class"
           clusterName: "prod-eks"
           cloud: "aws"
+
         clickhouse:
           enabled: true
           user: "admin"
@@ -29,18 +30,24 @@ spec:
             shardsCount: 1
             replicasCount: 1
           zookeeper:
-            enabled: true          
+            enabled: true
             replicaCount: 1
           resources:
             requests:
               cpu: "1"
-              memory: "1Gi"
+              memory: "2Gi"
             limits:
               cpu: "2"
-              memory: "2Gi"
+              memory: "6Gi"
           persistence:
             size: "20Gi"
             storageClass: "default-storage-class"
+          settings:
+            max_server_memory_usage_to_ram_ratio: "0.9"
+          profiles:
+            default/max_memory_usage: "4000000000"
+            admin/max_memory_usage: "4000000000"
+
         signoz:
           replicaCount: 1
           resources:
@@ -53,6 +60,44 @@ spec:
           persistence:
             size: "10Gi"
             storageClass: "default-storage-class"
+
+          otelCollector:
+            config:
+              processors:
+                filter/health:
+                  spans:
+                    exclude:
+                      match_type: regexp
+                      span_names:
+                        - "GET /healthz"
+                        - "GET /readyz"
+                        - "GET /health"
+                        - "GET /startup"
+                        - "GET /collections"
+                      attributes:
+                        - key: http.url
+                          match_type: regexp
+                          value: ".*/healthz|.*/readyz|.*/health|.*/collections|.*/ping"
+                resource:
+                  attributes:
+                    - key: service.name
+                      from_attribute: service.name
+                      action: upsert
+              service:
+                pipelines:
+                  traces:
+                    receivers: [otlp]
+                    processors: [filter/health, resource, batch]
+                    exporters: [clickhousetracesexporter]
+                  metrics:
+                    receivers: [otlp]
+                    processors: [resource, batch]
+                    exporters: [clickhousemetricsexporter]
+                  logs:
+                    receivers: [otlp]
+                    processors: [resource, batch]
+                    exporters: [clickhouselogsexporter]
+
   destination:
     server: https://kubernetes.default.svc
     namespace: signoz
