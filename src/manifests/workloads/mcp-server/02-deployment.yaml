@@ -80,11 +80,7 @@ spec:
               value: kestral_policies
             - name: EMBEDDING_MODEL
               value: BAAI/bge-small-en-v1.5
-
-            # Retriever (not directly called by mcp-server, but available)
-            - name: RETRIEVER_URL
-              value: http://retriever-minimal-svc.inference.svc.cluster.local:8001
-
+              
             - name: HOME
               value: /tmp
               
