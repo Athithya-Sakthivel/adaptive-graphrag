@@ -101,19 +101,40 @@ bash src/scripts/infra/argo_setup.sh --rollout
 
 bash src/scripts/infra/default_storage_class.sh k3s
 
+aws s3 rm s3://s3-temp-bucket-mlsecops-681802563986 --recursive
+bash src/scripts/infra/postgres_cluster.sh deploy
+
+
 kubectl create ns external-secrets-system || true
 
 
 echo "==> Creating aws-creds secret required by ESO controller"
+
 kubectl -n external-secrets-system create secret generic aws-creds \
   --from-literal=access-key-id="${AWS_ACCESS_KEY_ID}" \
   --from-literal=secret-access-key="${AWS_SECRET_ACCESS_KEY}" \
-  --from-literal=session-token="${AWS_SESSION_TOKEN:-}" \
-  --from-literal=region="${AWS_REGION}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-  
+  --from-literal=region="${AWS_REGION}"
+
 sleep 3
 
 bash src/scripts/infra/secrets_management.sh
 
 kubectl apply -f src/argo-apps/observability/signoz-application.yaml
+
+kubectl apply -f src/argo-apps/rag
+
+
+sleep 1800
+
+bash src/secrets/ssm_paramter_store.sh
+
+kubectl apply -f src/argo-apps/workloads/mcp_server.yaml
+
+
+kubectl port-forward -n inference svc/dense-svc 8200:8200 & \
+kubectl port-forward -n qdrant svc/qdrant 6333:6333 & \
+sleep 2
+
+python3 src/workloads/rag/index-policies/index.py src/workloads/rag/policies --recreate
+
+

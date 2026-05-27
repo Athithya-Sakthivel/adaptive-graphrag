@@ -30,19 +30,12 @@ spec:
                 name: aws-creds
                 key: secret-access-key
 
-          - name: AWS_SESSION_TOKEN
-            valueFrom:
-              secretKeyRef:
-                name: aws-creds
-                key: session-token
-                optional: true
-
           - name: AWS_REGION
             valueFrom:
               secretKeyRef:
                 name: aws-creds
                 key: region
-
+                
         resources:
           requests:
             cpu: 50m
@@ -62,3 +55,4 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+

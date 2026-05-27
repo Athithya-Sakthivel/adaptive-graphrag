@@ -6,13 +6,6 @@ aws ssm put-parameter \
     --overwrite
 
 aws ssm put-parameter \
-    --name "/autonomous-incident-responder/tool-server/api-key" \
-    --value "$(openssl rand -hex 32)" \ 
-    --type "SecureString" \
-    --region ap-south-1 \
-    --overwrite
-
-aws ssm put-parameter \
     --name "/autonomous-incident-responder/signoz/clickhouse/admin-password" \
     --value "$(openssl rand -base64 32)" \
     --type "SecureString" \
