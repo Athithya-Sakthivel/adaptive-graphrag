@@ -62,9 +62,25 @@ spec:
             storageClass: "default-storage-class"
 
           otelCollector:
-            opamp:
-              enabled: false          
-            config:
+            # Prevent the default ConfigMap, which hardcodes OpAmp args
+            configMap:
+              create: false
+            # Explicitly define the collector command to bypass OpAmp
+            command:
+              name: "/signoz-otel-collector"
+              extraArgs:
+                - "--config=/conf/otel-collector-config.yaml"
+                - "--copy-path=/var/tmp/collector-config.yaml"
+            # Provide the full collector configuration inline
+            config: |
+              receivers:
+                otlp:
+                  protocols:
+                    grpc:
+                      endpoint: 0.0.0.0:4317
+                      max_recv_msg_size_mib: 16
+                    http:
+                      endpoint: 0.0.0.0:4318
               processors:
                 filter/health:
                   spans:
@@ -85,7 +101,26 @@ spec:
                     - key: service.name
                       from_attribute: service.name
                       action: upsert
+                batch: {}
+              exporters:
+                clickhousetracesexporter:
+                  dsn: "tcp://$(CLICKHOUSE_USER):$(CLICKHOUSE_PASSWORD)@$(CLICKHOUSE_HOST):$(CLICKHOUSE_PORT)/"
+                  cluster: "$(CLICKHOUSE_CLUSTER)"
+                clickhousemetricsexporter:
+                  dsn: "tcp://$(CLICKHOUSE_USER):$(CLICKHOUSE_PASSWORD)@$(CLICKHOUSE_HOST):$(CLICKHOUSE_PORT)/"
+                  cluster: "$(CLICKHOUSE_CLUSTER)"
+                clickhouselogsexporter:
+                  dsn: "tcp://$(CLICKHOUSE_USER):$(CLICKHOUSE_PASSWORD)@$(CLICKHOUSE_HOST):$(CLICKHOUSE_PORT)/"
+                  cluster: "$(CLICKHOUSE_CLUSTER)"
+              extensions:
+                health_check:
+                  endpoint: ":13133"
+                zpages:
+                  endpoint: ":55679"
               service:
+                extensions:
+                  - health_check
+                  - zpages
                 pipelines:
                   traces:
                     receivers: [otlp]
