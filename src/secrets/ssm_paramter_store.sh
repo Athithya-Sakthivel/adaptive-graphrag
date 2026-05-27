@@ -7,7 +7,7 @@ aws ssm put-parameter \
 
 aws ssm put-parameter \
     --name "/autonomous-incident-responder/signoz/clickhouse/admin-password" \
-    --value "$(openssl rand -base64 32)" \
+    --value "$(cat /dev/urandom | tr -dc 'A-Za-z' | head -c 32)" \
     --type "SecureString" \
     --region "${AWS_REGION}" \
     --overwrite

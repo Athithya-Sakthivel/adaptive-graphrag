@@ -62,6 +62,8 @@ spec:
             storageClass: "default-storage-class"
 
           otelCollector:
+            opamp:
+              enabled: false          
             config:
               processors:
                 filter/health:
