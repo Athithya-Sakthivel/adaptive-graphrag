@@ -114,7 +114,7 @@ until kubectl get application external-secrets-stores -n "${ARGO_NS}" >/dev/null
 done
 
 echo "==> Waiting for ClusterSecretStore resource to appear"
-until kubectl get clustersecretstore cluster-secret-store >/dev/null 2>&1; do
+until kubectl get clustersecretstore aws-ssm-store >/dev/null 2>&1; do
   sleep 2
 done
 

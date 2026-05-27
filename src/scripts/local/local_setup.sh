@@ -128,8 +128,10 @@ sleep 1800
 
 bash src/secrets/ssm_paramter_store.sh
 
-kubectl apply -f src/argo-apps/workloads/mcp_server.yaml
+kubectl apply -f src/manifests/infra/external-secrets/all-external-secrets.yaml
 
+
+kubectl apply -f src/argo-apps/workloads/mcp_server.yaml
 
 kubectl port-forward -n inference svc/dense-svc 8200:8200 & \
 kubectl port-forward -n qdrant svc/qdrant 6333:6333 & \
