@@ -97,6 +97,59 @@ echo "From any new terminal you can immediately use kubectl."
 echo "If you want to use kubectl in your current terminal, run:"
 echo "  source ~/.bashrc"
 
+
+# ============================================================================
+# 5.5 HARDEN CORE DNS — prevent DNS timeouts and silence warnings
+# ============================================================================
+echo "==> Hardening CoreDNS ..."
+
+# Scale to 2 replicas for redundancy
+kubectl scale deployment/coredns -n kube-system --replicas=2
+
+# Add resource guarantees so CoreDNS never gets starved
+kubectl patch deployment/coredns -n kube-system -p '{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "coredns",
+          "resources": {
+            "requests": {"cpu": "50m", "memory": "64Mi"},
+            "limits": {"cpu": "200m", "memory": "128Mi"}
+          }
+        }]
+      }
+    }
+  }
+}'
+
+# Remove duplicate cache line (default is 'cache 30', change to 'cache 60')
+kubectl get configmap coredns -n kube-system -o yaml | \
+  sed 's/cache 30/cache 60/' | \
+  kubectl apply -f -
+
+# Suppress "No files matching import glob pattern" warnings by creating
+# the coredns-custom ConfigMap with empty .override and .server files
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  # Empty .override and .server files silence the import warnings
+  dummy.override: |
+    # Placeholder to suppress CoreDNS import warnings
+  dummy.server: |
+    # Placeholder to suppress CoreDNS import warnings
+EOF
+
+# Wait for CoreDNS to be fully ready
+kubectl rollout restart deployment coredns -n kube-system
+kubectl rollout status deployment coredns -n kube-system --timeout=120s
+
+echo "==> CoreDNS hardened: 2 replicas, resource guarantees, 60s cache, no warnings"
+
 bash src/scripts/infra/argo_setup.sh --rollout
 
 bash src/scripts/infra/default_storage_class.sh k3s
@@ -119,12 +172,16 @@ sleep 3
 
 bash src/scripts/infra/secrets_management.sh
 
-kubectl apply -f src/argo-apps/observability/signoz-application.yaml
+bash src/scripts/local/infra/signoz.sh
 
 kubectl apply -f src/argo-apps/rag
 
 
-sleep 1800
+sleep 800
+
+kubectl port-forward -n default svc/postgres-pooler 5432:5432 &
+sleep 2
+python3 src/tests/simulate_company/create_fake_tables.py
 
 bash src/secrets/ssm_paramter_store.sh
 
