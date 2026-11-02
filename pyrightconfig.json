@@ -1,0 +1,7 @@
+{
+  "typeCheckingMode": "standard",
+  "pythonVersion": "3.14",
+  "exclude": [".venv", "__pycache__"],
+  "reportMissingImports": false,
+  "reportOptionalMemberAccess": false
+}

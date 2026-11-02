@@ -206,7 +206,7 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
-#
+# PyPI configuration file
 .pypirc
 
 # Marimo
@@ -217,6 +217,18 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .repos
-.tmp.md
-values.yaml
-cnpg-1.28.2.yaml
+.env
+.env.example
+.terraform
+temp.md
+
+.terraform
+plans
+.backend
+.terraform
+terraform.tfstate
+postgres
+terraform.tfstate.backup
+tfplan
+.plans
+tmp
