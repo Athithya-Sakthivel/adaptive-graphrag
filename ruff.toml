@@ -1,0 +1,19 @@
+# ruff.toml
+target-version = "py314"
+line-length = 100
+
+exclude = [
+  ".repos",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".git",
+]
+
+[lint]
+select = ["E9", "F", "B", "UP", "I"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
