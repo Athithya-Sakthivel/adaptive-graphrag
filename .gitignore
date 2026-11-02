@@ -232,3 +232,6 @@ terraform.tfstate.backup
 tfplan
 .plans
 tmp
+
+
+vulngraph-inspect
