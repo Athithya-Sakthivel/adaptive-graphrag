@@ -1,6 +1,7 @@
 cd /workspace/data/
 
 python3 -m venv .venv
+source .venv/bin/activate
 pip install huggingface_hub==2.4.0
 
 
