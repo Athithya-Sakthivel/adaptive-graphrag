@@ -184,8 +184,8 @@ The chain is documented in `DATA_SOURCES.md` — the `docket_id → dockets → 
 | **`medium`** | 100,000 | **426,462** | 92,157 | 200 | ~1.1 GB | ~10 min |
 | **`max`** | 400,000 | ~1.7M (est.) | ~370,000 | 200 | ~4.5 GB | ~45 min |
 
-**`min`** is a pipeline smoke test — the graph is too sparse (1,951 edges) for 2-hop traversal.  
-**`medium`** is the demo scale — 426K edges support multi-hop precedent chains and adaptive routing.  
+**`min`** is a pipeline smoke test — the graph is too sparse (1,951 edges) for 2-hop traversal.
+**`medium`** is the demo scale — 426K edges support multi-hop precedent chains and adaptive routing.
 **`max`** is the portfolio claim — supports "~2M vectors" without inflating chunk counts.
 
 ---
