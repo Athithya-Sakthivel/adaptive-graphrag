@@ -1,0 +1,275 @@
+{
+  "status": "PASS",
+  "model": "Hanno-Labs/dinghy-law-0.6b-v1",
+  "format": "OpenVINO IR FP16",
+  "quantization": "none",
+  "fixture": "synthetic smoke test: 4 queries / 14 passages; not a benchmark or legal-quality evaluation",
+  "checks": [
+    {
+      "name": "torch_fp32_vs_openvino_fp16_query",
+      "passed": true,
+      "metrics": {
+        "n": 4,
+        "min": 1.0,
+        "mean": 1.0,
+        "p05": 1.0,
+        "mae": 1.1141635241074255e-06,
+        "max_abs_error": 6.452202796936035e-06
+      }
+    },
+    {
+      "name": "torch_fp32_vs_openvino_fp16_document",
+      "passed": true,
+      "metrics": {
+        "n": 15,
+        "min": 0.9999995827674866,
+        "mean": 1.0,
+        "p05": 0.9999998211860657,
+        "mae": 3.0420928851526696e-06,
+        "max_abs_error": 0.00010181963443756104
+      }
+    },
+    {
+      "name": "torch_fp32_vs_openvino_fp16 retrieval parity",
+      "passed": true,
+      "metrics": {
+        "recall1_equal": true,
+        "recall5_equal": true,
+        "relevant_top1_equal": true,
+        "relevant_hits_equal": true,
+        "jaccard5": 1.0,
+        "top1": 1.0,
+        "mrr_drop": 0.0
+      }
+    },
+    {
+      "name": "tokenizer and prompt parity",
+      "passed": true
+    }
+  ],
+  "cosine": {
+    "torch_fp32_vs_openvino_fp16_query": {
+      "n": 4,
+      "min": 1.0,
+      "mean": 1.0,
+      "p05": 1.0,
+      "mae": 1.1141635241074255e-06,
+      "max_abs_error": 6.452202796936035e-06
+    },
+    "torch_fp32_vs_openvino_fp16_document": {
+      "n": 15,
+      "min": 0.9999995827674866,
+      "mean": 1.0,
+      "p05": 0.9999998211860657,
+      "mae": 3.0420928851526696e-06,
+      "max_abs_error": 0.00010181963443756104
+    }
+  },
+  "retrieval": {
+    "pytorch_fp32": {
+      "recall1": 1.0,
+      "recall5": 1.0,
+      "mrr": 1.0
+    },
+    "openvino_fp16": {
+      "recall1": 1.0,
+      "recall5": 1.0,
+      "mrr": 1.0
+    },
+    "torch_fp32_vs_openvino_fp16": {
+      "recall1_equal": true,
+      "recall5_equal": true,
+      "relevant_top1_equal": true,
+      "relevant_hits_equal": true,
+      "jaccard5": 1.0,
+      "top1": 1.0,
+      "mrr_drop": 0.0
+    }
+  },
+  "files_mb": {
+    "xml": 2.06,
+    "bin": 1136.35
+  },
+  "script_sha256": "89378d10ce915283f60eb483da432f54851855daa187ca5de31b98857873f6c7",
+  "environment": {
+    "python": "3.14.4",
+    "platform": "Linux-6.18.33.1-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "torch": "2.15.0+cpu",
+    "torchvision": "missing",
+    "sentence_transformers": "6.2.0",
+    "transformers": "5.5.4",
+    "openvino": "2026.4.1-22982-e213a147257-releases/2026/4",
+    "optimum_intel": "2.2.0",
+    "optimum": "2.3.0",
+    "huggingface_hub": "1.21.0",
+    "cpu": {
+      "machine": "x86_64",
+      "vendor": "AuthenticAMD",
+      "model": "AMD Ryzen 7 5700U with Radeon Graphics",
+      "avx2": true,
+      "avx512": false,
+      "vnni": false,
+      "source": "/proc/cpuinfo"
+    },
+    "openvino_devices": [
+      "CPU"
+    ],
+    "cpu_threads_torch": 8,
+    "cpu_threads_openvino": 8,
+    "openvino_performance_hint": "LATENCY"
+  },
+  "memory_before": {
+    "current_bytes": 2321731584,
+    "limit": "max",
+    "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+    "host": {
+      "MemTotal": 11485184000,
+      "MemAvailable": 9664344064,
+      "SwapTotal": 2147483648,
+      "SwapFree": 2147483648
+    }
+  },
+  "model_revision": "080ba18e73c85ce8a513241b011b867174883175",
+  "speed": {
+    "pytorch_fp32_rows_per_second": 1.1945995113918382,
+    "openvino_fp16_rows_per_second": 1.1992426882276592,
+    "openvino_fp16_vs_pytorch_fp32": 1.0038868062405377
+  },
+  "reference": {
+    "execution_dtype": "float32",
+    "declared_checkpoint_dtype": "torch.float32",
+    "checkpoint_weights_note": "The immutable Hub revision declares BF16 weights. The reference loads those values into FP32 tensors; this does not recreate precision absent from the source checkpoint. A temporary local FP32 serialization is used as the OpenVINO export source so that OpenVINO's supported FP32-to-FP16 compression can produce an FP16 IR.",
+    "embedding_dimension": 1024,
+    "max_seq_length": 8192,
+    "tokenizer": {
+      "sha256": "fd7542d0b64e118db91bed0c4db9dbea440071a5056fe9ee8870b8350065ec93",
+      "texts": 19,
+      "min_tokens": 11,
+      "max_tokens": 902,
+      "vocab_size": 151669
+    },
+    "prompts": {
+      "default_prompt_name": null,
+      "prompts": {
+        "document": "",
+        "query": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+      }
+    },
+    "export_source_original_config_dtype": "torch.float32",
+    "export_source_safetensors_dtype_counts": {
+      "F32": 312
+    }
+  },
+  "openvino_ir": {
+    "xml": "/workspace/models/.dinghy-openvino-fp16-g7juhjp4/openvino/openvino_model.xml",
+    "xml_bytes": 2155001,
+    "bin": "/workspace/models/.dinghy-openvino-fp16-g7juhjp4/openvino/openvino_model.bin",
+    "bin_bytes": 1191553417,
+    "constant_nodes": 1642,
+    "constant_elements_by_type": {
+      "f16": 595776804,
+      "i32": 516,
+      "i64": 1260,
+      "f32": 141,
+      "boolean": 1
+    },
+    "float_constant_elements": {
+      "f16": 595776804,
+      "f32": 141,
+      "bf16": 0
+    },
+    "fp16_fraction_of_float_constants": 0.9999997633342459,
+    "inputs": [
+      "input_ids",
+      "attention_mask"
+    ],
+    "outputs": [
+      "last_hidden_state"
+    ],
+    "cpu_graph_smoke": {
+      "device": "CPU",
+      "shapes": [
+        {
+          "input_ids": [
+            1,
+            13
+          ],
+          "token_output": [
+            1,
+            13,
+            1024
+          ]
+        },
+        {
+          "input_ids": [
+            2,
+            902
+          ],
+          "token_output": [
+            2,
+            902,
+            1024
+          ]
+        },
+        {
+          "input_ids": [
+            1,
+            902
+          ],
+          "token_output": [
+            1,
+            902,
+            1024
+          ]
+        }
+      ]
+    }
+  },
+  "openvino_validation": {
+    "tokenizer": {
+      "sha256": "fd7542d0b64e118db91bed0c4db9dbea440071a5056fe9ee8870b8350065ec93",
+      "texts": 19,
+      "min_tokens": 11,
+      "max_tokens": 902,
+      "vocab_size": 151669
+    },
+    "prompts": {
+      "default_prompt_name": null,
+      "prompts": {
+        "document": "",
+        "query": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+      }
+    },
+    "padding": {
+      "encode_query": 1.0000001192092896,
+      "encode_document": 1.0
+    },
+    "timings_seconds": [
+      15.821848528000032,
+      15.864815374999921
+    ]
+  },
+  "artifact": {
+    "directory": "/workspace/models/dinghy_law_openvino_fp16",
+    "xml": "openvino/openvino_model.xml",
+    "bin": "openvino/openvino_model.bin",
+    "xml_sha256": "3398a4ca7c562afe7efe74b7514839c92ae4c5c4efb067cb3919b9ee2eef1c33",
+    "bin_sha256": "9e66e5c37291f7e38c3689fa9ffd9d7755016f5f1594c00c2d0655d9c2fc4771",
+    "format": "OpenVINO IR",
+    "weight_precision": "FP16",
+    "ir_scope": "Transformer encoder IR constants only; pooling, Dense projection, and normalization remain in the Sentence-Transformers pipeline.",
+    "quantization": "none"
+  },
+  "memory_after": {
+    "current_bytes": 6403452928,
+    "limit": "max",
+    "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0",
+    "host": {
+      "MemTotal": 11485184000,
+      "MemAvailable": 4851449856,
+      "SwapTotal": 2147483648,
+      "SwapFree": 1316577280
+    }
+  },
+  "seconds": 211.66
+}

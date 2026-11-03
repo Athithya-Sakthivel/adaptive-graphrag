@@ -246,3 +246,8 @@ llm
 *.tar.gz
 .dinghy-int8-303ci_42
 dinghy_law_onnx_int8
+
+dinghy_law_onnx_int8_weight_only
+openvino_export.log
+
+dinghy_law_openvino_fp16
