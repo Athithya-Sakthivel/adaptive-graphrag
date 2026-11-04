@@ -19,8 +19,7 @@ from .embedder import MAX_SEQ_LENGTH, build_embedder_version
 
 logger = logging.getLogger("indexing_pipeline")
 
-# Suppress HF's "PyTorch was not found" banner. Set here — the lowest
-# module in the pipeline package that imports anything HF-adjacent.
+# Suppress HF's "PyTorch was not found" banner.
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
@@ -167,6 +166,7 @@ class Config:
 
     @property
     def embedder_version(self) -> str:
+        # Device-independent: GPU and CPU produce equivalent vectors.
         return build_embedder_version(self.max_seq_length)
 
     def validated(self) -> Config:
