@@ -419,19 +419,42 @@ def _trim_span(text: str, start: int, end: int) -> tuple[int, int]:
 
 
 def _paragraph_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
-    result: list[tuple[int, int]] = []
-    cursor = start
-    for match in re.finditer(r"\n[ \t]*\n+", text[start:end]):
-        sep_start = start + match.start()
-        sep_end = start + match.end()
-        left, right = _trim_span(text, cursor, sep_start)
+    body = text[start:end]
+
+    # Primary: double-newline (paragraph) boundaries
+    if re.search(r"\n[ \t]*\n", body):
+        result: list[tuple[int, int]] = []
+        cursor = start
+        for match in re.finditer(r"\n[ \t]*\n+", body):
+            sep_start = start + match.start()
+            sep_end = start + match.end()
+            left, right = _trim_span(text, cursor, sep_start)
+            if left < right:
+                result.append((left, right))
+            cursor = sep_end
+        left, right = _trim_span(text, cursor, end)
         if left < right:
             result.append((left, right))
-        cursor = sep_end
-    left, right = _trim_span(text, cursor, end)
-    if left < right:
-        result.append((left, right))
-    return result
+        return result
+
+    # Fallback: single-newline boundaries (line-level split)
+    if "\n" in body:
+        result = []
+        cursor = start
+        for match in re.finditer(r"\n+", body):
+            sep_start = start + match.start()
+            sep_end = start + match.end()
+            left, right = _trim_span(text, cursor, sep_start)
+            if left < right:
+                result.append((left, right))
+            cursor = sep_end
+        left, right = _trim_span(text, cursor, end)
+        if left < right:
+            result.append((left, right))
+        return result
+
+    # Last resort: one span (whole opinion) — sentence splitter handles this
+    return [(start, end)] if start < end else []
 
 
 def _sentence_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
@@ -440,6 +463,9 @@ def _sentence_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
     body = text[start:end]
     for match in re.finditer(r'(?<=[.!?])[\x22\x27\u201d\u2019)]*\s+(?=[A-Z0-9("])', body):
         boundary = start + match.start()
+        # Skip boundaries that fall inside an atomic span
+        if not _is_atomic_boundary(text, boundary):
+            continue
         left, right = _trim_span(text, cursor, boundary)
         if left < right:
             result.append((left, right))
@@ -448,9 +474,6 @@ def _sentence_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
     if left < right:
         result.append((left, right))
     return result or [(start, end)]
-
-
-# ── Size-aware cut ─────────────────────────────────────────────────────
 
 
 def _safe_cut(
