@@ -116,7 +116,8 @@ echo "==> Installing Python tooling..."
 python3 -m pip install --break-system-packages --ignore-installed -q \
   pytest==9.0.3 \
   pre-commit==4.2.0 \
-  httpx==0.28.1
+  huggingface_hub==2.4.0 \
+
 
 # ===========================================================================
 # 5. Pre-commit hooks

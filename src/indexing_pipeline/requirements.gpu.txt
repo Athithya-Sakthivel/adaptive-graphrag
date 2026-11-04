@@ -1,0 +1,14 @@
+# requirements.gpu.txt — for Kaggle T4 / CUDA machines.
+# Kaggle preinstalls: torch (cu130), sentence-transformers, transformers,
+# numpy, pandas, pyarrow. Does NOT reinstall them; Kaggle's CUDA torch wheel
+# is already matched to the driver.
+#
+# This file installs only what Kaggle is missing AND what pipeline.py /
+# db.py / embedder.py import at module level. The GPU path never uses
+# psycopg or pgvector, but pipeline.py imports db.py, so the packages must
+# be importable.
+
+psycopg[binary]>=3.2,<4.0
+psycopg-pool>=3.2,<4.0
+pgvector>=0.3,<0.4
+openvino>=2026.4.1
