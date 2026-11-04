@@ -176,8 +176,9 @@ class Config:
             raise TypeError("model_dir must be a Path")
         if not isinstance(self.gpu_model_dir, Path):
             raise TypeError("gpu_model_dir must be a Path")
-        if not self.db_dsn or not self.db_dsn.strip():
-            raise ValueError("db_dsn is required")
+        # db_dsn may be empty — required only for load/validate/index/drop-index.
+        if self.db_dsn and not self.db_dsn.strip():
+            raise ValueError("db_dsn, when provided, must be non-empty after strip")
         if not 1 <= self.max_seq_length <= 8192:
             raise ValueError(f"max_seq_length must be 1..8192, got {self.max_seq_length}")
         if not 1 <= self.workers <= WORKER_MODE_MAX:
@@ -199,12 +200,10 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
+        # DATABASE_URL is optional. Stages that need Postgres (load, validate,
+        # index, drop-index) raise a clear PipelineError when db_dsn is empty.
+        # The embed stage never opens a database connection, so it runs without.
         dsn = os.environ.get("DATABASE_URL", "").strip()
-        if not dsn:
-            raise ValueError(
-                "DATABASE_URL is required.\n"
-                "  export DATABASE_URL='postgresql://user:pass@host:5432/db'"
-            )
         return cls(
             data_dir=DEFAULT_DATA_DIR,
             model_dir=DEFAULT_MODEL_DIR,
