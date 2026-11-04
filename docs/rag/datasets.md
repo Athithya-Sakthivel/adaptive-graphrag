@@ -1,759 +1,610 @@
 # Adaptive-GraphRAG — Dataset Reference
 
-Scope: Defines every dataset in the adaptive-graphrag retrieval system — role, schema, provenance, join topology, scale presets, and the retrieval techniques each dataset supports.
-Audience: Engineers building ingestion, indexing, retrieval, or evaluation against these datasets.
+**Scope:** Dataset roles, schemas, provenance, join keys, scale presets, and dataset-to-technique dependencies for the Adaptive-GraphRAG retrieval system.
+
+**Audience:** Engineers working on ingestion, indexing, retrieval, and evaluation.
+
+**Status:** Snapshot-specific reference. Row counts and file sizes below describe the stated `2026-06-30` upstream snapshot and the `min`, `medium`, and `max` build presets. Values marked *estimated* are planning estimates, not release guarantees. For an actual release, `MANIFEST.json` is authoritative for file names, row counts, hashes, and sizes.
 
 ---
 
-## 1. Purpose and Scope
+## 1. Purpose and scope
 
-The adaptive-graphrag system answers legal research queries over United States case law with four retrieval arms: dense vector, sparse lexical, citation graph, and deterministic metadata filtering. Adaptive routing selects the cheapest arm(s) per query at runtime.
+Adaptive-GraphRAG retrieves information from United States case law using four retrieval capabilities:
 
-This document specifies the datasets that back those arms. It is the single authoritative reference for:
+1. **Dense retrieval** over embeddings of opinion chunks.
+2. **Sparse retrieval** over chunk text and selected lexical metadata.
+3. **Citation-graph retrieval** over directed `CITES` edges between opinions.
+4. **Metadata filtering** over opinion-cluster metadata and opinion-level corpus fields.
 
-- What data exists in the system and why
-- The exact schema of each dataset
-- How the datasets join to one another
-- What scale each dataset operates at
-- What each dataset proves in the evaluation harness
-- What is deliberately not shipped
+An adaptive router may select one or more capabilities for a query. The examples in this document describe intended query-to-retrieval mappings; they are not a claim that one route is optimal for every query in a class.
 
-It does not describe ingestion mechanics, chunking strategy, embedding models, the retrieval router, or the evaluation methodology. Those are separate documents under docs/rag/.
+This document defines the datasets consumed by those capabilities and the isolated evaluation data shipped with them. It does not specify the chunking algorithm, embedding model, index implementation, router logic, or evaluation protocol. Those belong in their respective documents under `docs/rag/`.
 
----
+### 1.1 Query examples and intended retrieval inputs
 
-## 2. System Context
+| Query class | Example | Relevant data |
+|---|---|---|
+| Holding or issue question | “What did the court hold on qualified immunity?” | Opinion text; chunk embeddings; lexical index |
+| Citation lookup | “Find cases citing Roe v. Wade.” | Citation graph; corpus metadata for display and resolution |
+| Precedent-chain exploration | “Trace how the undue-burden standard evolved.” | Citation graph plus opinion text for substantive analysis |
+| Metadata-constrained search | “Published Ninth Circuit opinions after 2022 on X.” | Cluster metadata for `precedential_status` and `date_filed`; corpus fields for `court`, `jurisdiction`, and opinion text |
 
-The retrieval thesis is that legal queries are heterogeneous, and no single retrieval arm is optimal for all of them. Three classes dominate:
+The datasets have separate responsibilities:
 
-Query class: Holding
-Example: "What did the court hold on qualified immunity?"
-Optimal arm: Dense + sparse
+- The **corpus** contains opinion text and opinion-level metadata.
+- The **citation graph** contains directed opinion-to-opinion citation edges.
+- The **cluster metadata** file contains one record per selected CourtListener cluster.
+- The **evaluation data** contains a chunking-ablation set and a graph-derived citation-lookup set. Neither evaluation set is production corpus data.
 
-Query class: Citation lookup
-Example: "Find cases citing Roe v. Wade"
-Optimal arm: Sparse + graph
+### 1.2 Published directory layout
 
-Query class: Precedent chain
-Example: "Trace how the undue-burden standard evolved"
-Optimal arm: Graph (2-hop)
+The dataset snapshot uses the following layout at each scale. Row counts vary by scale; the path layout is intended to remain stable.
 
-Query class: Metadata-filtered
-Example: "Published Ninth Circuit opinions after 2022 on X"
-Optimal arm: Deterministic filter + dense
+```text
+data/raw/
+├── corpus/
+│   └── opinions.parquet
+├── graph/
+│   └── citations_filtered.parquet
+├── metadata/
+│   └── clusters_filtered.parquet
+└── eval_isolated/
+    ├── hojicha/
+    │   ├── corpus.parquet
+    │   └── questions.parquet
+    └── synthesized_graph_qa/
+        └── queries.parquet
+```
 
-To support these classes, the system maintains four independent stores rather than one monolithic index:
-
-1. A full-text corpus for semantic and lexical retrieval
-2. A citation graph for precedent traversal
-3. A cluster metadata table for deterministic filtering
-4. Two evaluation sets isolated from production
-
-Each is sourced, filtered, and versioned independently. This separation is intentional — it allows the graph to grow, the corpus to be re-embedded, and the metadata to be re-filtered without invalidating the others.
-
----
-
-## 3. The Four Data Roles
-
-Role: Corpus
-Dataset: docketx/us-caselaw (streamed sample)
-Ships to HF: Yes
-Purpose: Full-text opinions + per-opinion metadata
-
-Role: Graph
-Dataset: CourtListener citation-map (filtered)
-Ships to HF: Yes
-Purpose: CITES edges between opinions
-
-Role: Metadata
-Dataset: CourtListener opinion-clusters (filtered)
-Ships to HF: Yes
-Purpose: Cluster-level fields for deterministic filtering
-
-Role: Evaluation
-Dataset: feyninc/hojicha + synthesized QA
-Ships to HF: Yes
-Purpose: Chunking ablation + citation-lookup ground truth
-
-Every dataset below lives under data/raw/ in the published snapshot. The directory tree is identical at every scale; only row counts change.
-
-    data/raw/
-    ├── corpus/opinions.parquet
-    ├── graph/citations_filtered.parquet
-    ├── metadata/clusters_filtered.parquet
-    └── eval_isolated/
-        ├── hojicha/{corpus,questions}.parquet
-        └── synthesized_graph_qa/queries.parquet
+The six Parquet files above are the dataset artifacts. Repository/release metadata files are separate and should be counted from the release manifest rather than included in a dataset-file count.
 
 ---
 
-## 4. Dataset 1 — Corpus (corpus/opinions.parquet)
+## 2. Dataset 1 — Opinion corpus
 
-### 4.1 Role
+**Path:** `corpus/opinions.parquet`
+**Upstream:** Hugging Face dataset `docketx/us-caselaw`, described as a mirror of CourtListener full-text opinions.
+**Upstream snapshot:** CourtListener bulk snapshot dated `2026-06-30`.
+**Role:** Source records for opinion text, opinion-level metadata, chunk creation, and opinion display.
 
-The production retrieval corpus. Every chunk embedded into the dense index, every term indexed into the sparse index, and every document returned by a retrieval arm originates here.
+The corpus is the source of the text that is chunked and embedded. The graph and metadata datasets are joined back to corpus opinions; they are not substitutes for the opinion text.
 
-This is the only dataset indexed for retrieval. All others are either lookup tables (graph, metadata) or evaluation artifacts.
+### 2.1 Schema
 
-### 4.2 Source
+The following schema is the schema declared by the source dataset documentation. Confirm the released Parquet schema against `MANIFEST.json` when publishing a new snapshot.
 
-HuggingFace: docketx/us-caselaw — a mirror of the CourtListener full-text corpus, retrieved from CourtListener bulk snapshot 2026-06-30. Public domain.
+| Column | Type | Nullable | Meaning |
+|---|---|---:|---|
+| `id` | string | No | `docketx` internal record identifier. |
+| `cl_opinion_id` | int64 | No | CourtListener opinion identifier. Used to join opinions to citation-graph endpoints. |
+| `cluster_id` | int64 | Yes | CourtListener cluster identifier. Used to join opinions to `clusters_filtered.id`. |
+| `opinion_type` | string | Yes | Opinion type, such as `majority`, `dissent`, `concurrence`, `plurality`, `per_curiam`, or `unknown`. |
+| `text_kind` | string | Yes | Text provenance/category, such as `original`, `combined`, or `generated`. |
+| `title` | string | Yes | Case display name. |
+| `text` | string | No | Opinion body supplied to the chunking pipeline. |
+| `citation` | string | Yes | Citation string, for example `410 U.S. 113`. |
+| `court` | string | Yes | Court slug, for example `ca9`, `scotus`, or `nysupct`. |
+| `date` | string | Yes | Opinion decision date in `YYYY-MM-DD` form. |
+| `jurisdiction` | string | Yes | Jurisdiction code, for example `us` or `us-ca9`. |
+| `doc_type` | string | Yes | Document category, such as `opinion`, `order`, or `other`. |
+| `license` | string | Yes | Upstream license identifier. |
+| `source` | string | Yes | Source-system label, for example `courtlistener`. |
+| `retrieved_at` | string | Yes | Retrieval timestamp in ISO format. |
 
-### 4.3 Schema
+### 2.2 Key semantics and indexing inputs
 
-Column: id
-Type: string
-Semantics: docketx internal record identifier
-Nullable: No
+There are two distinct join keys in the corpus:
 
-Column: cl_opinion_id
-Type: int64
-Semantics: CourtListener opinion ID — primary join key
-Nullable: No
+- `cl_opinion_id` is the **opinion-level key**. It connects corpus opinions to both endpoint columns in the citation graph.
+- `cluster_id` is the **cluster-level key**. It connects corpus opinions to `clusters_filtered.id`. It may be null.
 
-Column: cluster_id
-Type: int64
-Semantics: CourtListener cluster ID — joins to metadata
-Nullable: Yes
+These keys are not interchangeable. Not every relationship in the dataset is keyed by `cl_opinion_id`.
 
-Column: opinion_type
-Type: string
-Semantics: majority / dissent / concurrence / plurality / per_curiam / unknown
-Nullable: Yes
+`text` is the body supplied to the chunker. `title` and `citation` are retained as opinion metadata and may be used by the sparse-retrieval representation or for result display. The retrieval index should therefore be described as consuming chunk text plus selected metadata, not as consuming `text` alone for every retrieval mode.
 
-Column: text_kind
-Type: string
-Semantics: original / combined / generated — provenance of the text
-Nullable: Yes
+Opinion-level `court`, `jurisdiction`, and `date` are available without joining the CourtListener `dockets` or `courts` tables. `date` is the opinion date; `clusters_filtered.date_filed` is the cluster-level date. Use the date field whose semantics match the query being implemented, and document any fallback policy.
 
-Column: title
-Type: string
-Semantics: Case display name (e.g., Roe v. Wade)
-Nullable: Yes
+The source documentation describes a preference order for competing text variants: `original` before `combined` before `generated`. The final corpus must have a clearly defined row-selection policy. In particular, the opinion-level graph join assumes that `cl_opinion_id` identifies one canonical corpus opinion row. If multiple rows per `cl_opinion_id` are retained, joins from graph results to corpus records become one-to-many and that behavior must be explicit. The published artifact should be checked for this invariant rather than relying on the phrase “primary key” alone.
 
-Column: text
-Type: string
-Semantics: Full opinion body — the field that gets chunked
-Nullable: No
+### 2.3 Scale and chunk-count estimates
 
-Column: citation
-Type: string
-Semantics: Bluebook citation string (e.g., 410 U.S. 113)
-Nullable: Yes
+| Preset | Corpus rows | Estimated chunks | Interpretation |
+|---|---:|---:|---|
+| `min` | 5,000 | ~25,000 | Pipeline smoke-test scale. |
+| `medium` | 100,000 | ~500,000 | Demo scale. |
+| `max` | 400,000 | ~2,000,000 | Large demonstration scale. |
 
-Column: court
-Type: string
-Semantics: Court slug (e.g., ca9, scotus, nysupct)
-Nullable: Yes
+Chunk counts are estimates, not corpus row counts and not guaranteed embedding counts. The original estimate assumes roughly five chunks per opinion. Actual counts depend on the chunker, the source opinion lengths, and the final build configuration. Use the chunk-build output or index manifest for an exact vector count; do not present these estimates as measured vector totals.
 
-Column: date
-Type: string
-Semantics: Decision date, ISO 8601 (YYYY-MM-DD)
-Nullable: Yes
+Opinion bodies vary substantially in length. The source description gives examples ranging from short orders of roughly 500 tokens to long decisions of roughly 50,000 tokens. Chunk sizing, parent/child structure, and embedding limits are defined in the chunking and embedding documentation, not by this dataset reference.
 
-Column: jurisdiction
-Type: string
-Semantics: Jurisdiction code (e.g., us, us-ca9)
-Nullable: Yes
+### 2.4 Uses
 
-Column: doc_type
-Type: string
-Semantics: opinion / order / other
-Nullable: Yes
+The corpus supports:
 
-Column: license
-Type: string
-Semantics: Upstream license identifier
-Nullable: Yes
+- Dense retrieval after opinion text has been chunked and embedded.
+- Sparse retrieval over chunk text and selected fields such as case title and citation.
+- Hierarchical chunk construction from opinion bodies.
+- Opinion-level filtering or display using fields such as `court`, `jurisdiction`, and `date`.
 
-Column: source
-Type: string
-Semantics: Source system (e.g., courtlistener)
-Nullable: Yes
-
-Column: retrieved_at
-Type: string
-Semantics: ISO timestamp of docketx retrieval
-Nullable: Yes
-
-### 4.4 Field Notes
-
-- cl_opinion_id is the primary key. Every join in the system originates from this column. It is unique within the corpus (deduplicated at ingestion).
-- cluster_id is the secondary key. Required for metadata joins. Approximately 0.3% of opinions lack a cluster ID (typical of very old or partially ingested records); these are retained in the corpus but excluded from cluster-level filtering.
-- text is the chunking target. No other column feeds the dense or sparse indexes. Chunking operates exclusively on text with title and citation retained as metadata.
-- text_kind distinguishes multiple texts per opinion. Some opinions have both original and generated variants; the pipeline currently uses all rows and deduplicates at ingestion by (cl_opinion_id, text_kind) preference order: original > combined > generated.
-- court and jurisdiction provide court metadata directly. This is why the dockets table is not downloaded — the corpus already carries what the metadata table would redundantly supply.
-- date is the opinion decision date, not the cluster date. Cluster dates may differ by hours to days for cluster-level metadata; for temporal filters on opinion text, corpus.date is authoritative.
-
-### 4.5 Cardinality
-
-Scale min: 5,000 corpus rows, ~25K estimated chunks
-Scale medium: 100,000 corpus rows, ~500K estimated chunks
-Scale max: 400,000 corpus rows, ~2M estimated chunks
-
-Full opinion bodies range from short orders (~500 tokens) to landmark decisions (~50,000 tokens). The chunker's hierarchical strategy produces variable chunk counts per opinion; the table above uses a ~5-chunks-per-document average.
-
-### 4.6 What This Dataset Proves
-
-The corpus enables:
-
-- Dense retrieval of semantically similar passages
-- Sparse retrieval of exact citations, case names, and statutes
-- Hierarchical chunking (child/parent structure)
-- Temporal and jurisdictional filtering via date and jurisdiction
+The corpus alone does not provide citation relationships or cluster-level `precedential_status` and `nature_of_suit` values.
 
 ---
 
-## 5. Dataset 2 — Citation Graph (graph/citations_filtered.parquet)
+## 3. Dataset 2 — Citation graph
 
-### 5.1 Role
+**Path:** `graph/citations_filtered.parquet`
+**Upstream:** CourtListener citation-map bulk file `citation-map-2026-06-30.csv.bz2`.
+**Upstream snapshot:** `2026-06-30`.
+**Role:** Directed citation edges between opinions in the selected corpus.
 
-The precedent citation network. Provides the edges that enable graph traversal — the retrieval arm that vector and lexical search cannot replace.
+The source file is reported as 526 MB compressed and 77,460,014 raw edges before filtering. The published graph retains edges for which both endpoint opinion IDs are present in the selected corpus.
 
-### 5.2 Source
+### 3.1 Schema
 
-CourtListener bulk snapshot 2026-06-30, file citation-map-2026-06-30.csv.bz2 (526 MB compressed, 77,460,014 raw edges). Filtered to edges where both endpoints exist in the sampled corpus. Public Domain Mark 1.0.
+| Column | Type | Meaning |
+|---|---|---|
+| `citing_opinion_id` | int64 | CourtListener ID of the opinion making the citation (edge source). |
+| `cited_opinion_id` | int64 | CourtListener ID of the opinion being cited (edge target). |
+| `depth` | int32 | CourtListener citation-depth/extraction field, as described by the source. |
 
-### 5.3 Schema
+### 3.2 Direction and `depth`
 
-Column: citing_opinion_id
-Type: int64
-Semantics: CourtListener ID of the citing opinion (the source of the citation)
+An edge `A -> B` means **opinion A cites opinion B**.
 
-Column: cited_opinion_id
-Type: int64
-Semantics: CourtListener ID of the cited opinion (the target)
+- To find opinions cited by A, select rows where `citing_opinion_id = A`.
+- To find opinions that cite A, select rows where `cited_opinion_id = A`.
 
-Column: depth
-Type: int32
-Semantics: CourtListener citation depth heuristic (1 = direct, higher = inferred)
+The source documentation describes `depth = 1` as a direct citation and values greater than 1 as inferred from context. It also explicitly cautions that `depth` is not a confidence score. Preserve the field as upstream extraction metadata; do not interpret a larger value as a stronger or weaker citation without a separate, documented ranking rule. All depth values are stated to be retained in the filtered graph.
 
-### 5.4 Field Notes
+### 3.3 Filtering and referential integrity
 
-- citing_opinion_id and cited_opinion_id are foreign keys into corpus.opinions.cl_opinion_id. Both are guaranteed to exist in the corpus — the filter stage drops any edge whose endpoints are not in the sample.
-- depth is not a confidence score. CourtListener uses depth to indicate citation extraction method, not reliability. depth = 1 means the citation was extracted from a directly quotable reference; depth > 1 means the extractor inferred it from context. All depths are retained; downstream ranking may weight by depth.
-- Direction matters. A -> B means A cites B. Reversed traversal (finding cases that cite A) requires querying cited_opinion_id = A. Both directions are supported by the schema without additional indexes.
+Both `citing_opinion_id` and `cited_opinion_id` refer to `corpus.opinions.cl_opinion_id`. The graph filter is described as retaining an edge only when **both** endpoint IDs are present in the selected corpus. Under that filtering rule, every published edge endpoint should resolve to a corpus opinion.
 
-### 5.5 Cardinality
+This guarantee is about graph endpoints. It does not imply that every corpus opinion has at least one incoming or outgoing edge.
 
-Scale min: 5,000 corpus rows, 1,951 edges, 0.39 avg out-degree
-Scale medium: 100,000 corpus rows, 426,462 edges, 4.26 avg out-degree
-Scale max: 400,000 corpus rows, ~1.7M edges (est.), ~4.25 avg out-degree
+### 3.4 Scale
 
-min scale produces a graph too sparse for multi-hop traversal. At 1,951 edges across 5,000 opinions, only a handful of 2-hop paths exist. This scale is a pipeline smoke test only.
+| Preset | Corpus rows | Filtered edges | Edges per corpus opinion |
+|---|---:|---:|---:|
+| `min` | 5,000 | 1,951 | 0.39 |
+| `medium` | 100,000 | 426,462 | 4.26 |
+| `max` | 400,000 | ~1,700,000 (estimated) | ~4.25 (estimated) |
 
-medium scale is the smallest demo-able graph. 426,462 edges across 100,000 opinions yields ~4.3 citations per opinion — enough that precedent chains have multiple valid intermediate nodes, and adaptive routing between graph and vector arms produces measurable differences.
+“Edges per corpus opinion” is `filtered edge count / corpus opinion count`. It is a corpus-normalized edge density. It should not be presented as the average degree among only those nodes that appear in the graph unless the graph's vertex denominator is defined that way.
 
-### 5.6 What This Dataset Proves
+The `min` graph is intended for pipeline validation, not for drawing retrieval-quality conclusions. Its smaller edge count means fewer available citation relationships. Whether a particular 1-hop or 2-hop query has results must be measured against the graph; edge count alone does not establish the number of reachable paths or the quality of a graph-versus-dense comparison.
 
-The citation graph enables:
+### 3.5 Uses and limits
 
-- 2-hop precedent traversal — "cases cited by cases that cite X"
-- In-degree ranking — "the most-cited opinions in this corpus"
-- Adaptive routing wins — graph-first retrieval for citation-lookup queries where vector search is approximate and graph is exact
+The graph supports:
 
-The graph is also the source of the synthesized evaluation set (see section 7.2). Every "Find cases citing X" query has a deterministic ground truth from citations_filtered.parquet.
+- Direct citation lookup in either direction.
+- In-degree and out-degree calculations, when the denominator is defined explicitly.
+- One-hop and multi-hop graph traversal.
+- Graph-derived ground truth for the direct citation-lookup evaluation set described in §6.2.
 
----
-
-## 6. Dataset 3 — Cluster Metadata (metadata/clusters_filtered.parquet)
-
-### 6.1 Role
-
-Cluster-level metadata for deterministic filtering. Enables metadata-prefiltered retrieval — narrowing the candidate set before ANN search rather than after.
-
-### 6.2 Source
-
-CourtListener bulk snapshot 2026-06-30, file opinion-clusters-2026-06-30.csv.bz2 (2.4 GB compressed, ~72M physical CSV rows). Cleaned (see section 6.5) and filtered to clusters referenced by the sampled corpus. Public Domain Mark 1.0.
-
-### 6.3 Schema
-
-Column: id
-Type: int64
-Semantics: CourtListener cluster ID — joins to corpus.cluster_id
-Indexed for filtering: Yes
-
-Column: case_name
-Type: string
-Semantics: Full case name, typically Plaintiff v. Defendant
-Indexed for filtering: No
-
-Column: case_name_short
-Type: string
-Semantics: Abbreviated case name (often just the defendant)
-Indexed for filtering: No
-
-Column: date_filed
-Type: string
-Semantics: Cluster decision date, ISO 8601
-Indexed for filtering: Yes
-
-Column: precedential_status
-Type: string
-Semantics: Published / Unpublished / Errata / Separate / In-chambers / Relating-to
-Indexed for filtering: Yes
-
-Column: citation_count
-Type: int64
-Semantics: Number of opinions citing this cluster
-Indexed for filtering: No
-
-Column: nature_of_suit
-Type: string
-Semantics: Subject-matter classification (e.g., Civil Rights, Habeas Corpus)
-Indexed for filtering: Yes
-
-Column: judges
-Type: string
-Semantics: Bench composition, free-form
-Indexed for filtering: No
-
-Column: docket_id
-Type: int64
-Semantics: FK into CourtListener dockets table (not shipped)
-Indexed for filtering: No
-
-### 6.4 Field Notes
-
-- court_id is deliberately absent. CourtListener's schema places court_id on the dockets table, two joins removed from opinion-clusters:
-
-      opinions.cluster_id  ->  clusters.id
-      clusters.docket_id   ->  dockets.id
-      dockets.court_id     ->  courts.id
-
-  Downloading dockets (larger than clusters) would add ~2 hours of pipeline for zero retrieval benefit, because corpus.court and corpus.jurisdiction already carry court metadata. The join is documented but not materialized.
-
-- precedential_status is a correctness filter, not a preference. Unpublished opinions are not citable as precedent in most US jurisdictions. Any query asking "what binds?" must filter precedential_status = 'Published'; the metadata table is the only reliable source for this.
-
-- case_name may contain HTML fragments for a subset of CourtListener exports. The upstream CSV embeds <parties>, <docketnumber>, <court> tags in unquoted multi-line fields. The cleaning stage validates int(row[0]) — the leading cluster ID — which is unaffected by downstream field corruption. Verified: 0 of 4,780 target clusters at --scale min had truncated case_name.
-
-- citation_count is a corpus-independent influence signal. It reflects citations in the entire CourtListener corpus, not just the sampled subset. Useful for influence ranking, but should not be confused with in-degree within citations_filtered.parquet.
-
-### 6.5 Cleaning Pipeline
-
-The upstream CSV has two documented irregularity classes:
-
-1. Multi-line fields. case_name, judges, and nature_of_suit may contain literal newlines that csv.reader interprets as row boundaries. Approximately 86% of physical rows are continuation fragments of multi-line fields, not real cluster records.
-
-2. Field-shifted rows. When a multi-line field breaks a record, downstream columns shift right. A shifted row may put a case name in the id column.
-
-The cleaning stage applies a single invariant: id is field 0 and must parse as a positive integer. A multi-line field at any position >= 1 cannot corrupt row[0]. Rows failing this check are dropped as fragments.
-
-Result: 10.2M clean cluster records from 71.4M physical CSV lines (14.3% retention rate). The 4,780 clusters matching --scale min and 92,157 clusters matching --scale medium were all recovered from the retained records — no truncation of case_name.
-
-### 6.6 Cardinality
-
-Scale min: 4,780 cluster records, 100% case_name complete
-Scale medium: 92,157 cluster records, 100% case_name complete
-Scale max: ~370,000 cluster records, 100% case_name complete (expected)
-
-### 6.7 What This Dataset Proves
-
-The metadata table enables:
-
-- Pre-filter before ANN — filter by precedential_status, date_filed, nature_of_suit before HNSW traversal, not after
-- Bindingness filtering — Published only for precedent queries
-- Temporal filtering — date_filed for "cases after 2020" queries
-- Subject-matter filtering — nature_of_suit for domain-scoped retrieval
+The graph contains `CITES` relationships only. It does not encode typed legal relationships such as `OVERRULES`, `DISTINGUISHES`, or `CONFLICTS_WITH`. Citation traversal alone therefore cannot establish whether a case remains good law.
 
 ---
 
-## 7. Dataset 4 — Evaluation Sets (eval_isolated/)
+## 4. Dataset 3 — Cluster metadata
 
-Evaluation sets are never indexed in the production retrieval store. They exist solely to measure whether the system retrieves, ranks, and grounds correctly. Contaminating production with evaluation data invalidates every metric.
+**Path:** `metadata/clusters_filtered.parquet`
+**Upstream:** CourtListener opinion-clusters bulk file `opinion-clusters-2026-06-30.csv.bz2`.
+**Upstream snapshot:** `2026-06-30`.
+**Role:** Cluster-level metadata used for deterministic filtering and case display.
 
-Two complementary evaluation sets are shipped.
+The upstream file is reported as 2.4 GB compressed and approximately 72 million physical CSV rows. The cleaned file is filtered to cluster IDs referenced by the selected corpus.
 
-### 7.1 Chunking Ablation — eval_isolated/hojicha/
+### 4.1 Schema
 
-Source: feyninc/hojicha (HuggingFace), derived from CUAD legal contracts. CC BY 4.0.
+| Column | Type | Meaning | Listed as filter field? |
+|---|---|---|---:|
+| `id` | int64 | CourtListener cluster ID; joins to `corpus.opinions.cluster_id`. | Yes |
+| `case_name` | string | Full case name. | No |
+| `case_name_short` | string | Abbreviated case name. | No |
+| `date_filed` | string | Cluster-level date in ISO date form. | Yes |
+| `precedential_status` | string | Status such as `Published`, `Unpublished`, `Errata`, `Separate`, `In-chambers`, or `Relating-to`. | Yes |
+| `citation_count` | int64 | CourtListener citation count for the cluster. | No |
+| `nature_of_suit` | string | Subject-matter classification, such as Civil Rights or Habeas Corpus. | Yes |
+| `judges` | string | Free-form bench-composition value. | No |
+| `docket_id` | int64 | CourtListener docket ID; the dockets table is not shipped. | No |
 
-Purpose: Measure whether the project's hierarchical chunker outperforms a fixed-size baseline. This is the only dataset in the system designed to isolate chunking quality from retrieval-model quality.
+“Listed as filter field” reproduces the intended use stated for this dataset; the actual database/index configuration should be checked separately.
 
-corpus.parquet — 194 rows
+### 4.2 Join and field semantics
 
-Column: title
-Type: string
-Semantics: Contract identifier
+`clusters_filtered.id` joins to `corpus.opinions.cluster_id`. Multiple opinions may belong to the same cluster, so cluster-row counts and corpus-opinion counts are different quantities.
 
-Column: text
-Type: string
-Semantics: Full contract text
+`date_filed` is a cluster-level date. It is not the same field as `corpus.opinions.date`, which is described as the opinion decision date. Query logic should choose the appropriate field and should not silently substitute one for the other.
 
-questions.parquet — 1,568 rows
+`court_id` is not present in this file. In the upstream CourtListener schema, the path to court metadata is described as:
 
-Column: question
-Type: string
-Semantics: Clause-identification question
+```text
+corpus.opinions.cluster_id -> clusters.id
+clusters.docket_id         -> dockets.id
+ dockets.court_id           -> courts.id
+```
 
-Column: document_title
-Type: string
-Semantics: Links the question to a corpus row
+The `dockets` and `courts` tables are not shipped in this snapshot. The corpus already contains `court` and `jurisdiction` fields, so court filtering should use those corpus fields unless a separate, documented reason requires the external normalized join.
 
-Column: chunk-must-contain
-Type: string
-Semantics: Ground truth: passage that MUST appear in the retrieved chunk
+`citation_count` is described as a CourtListener-wide count, not a count restricted to the sampled graph. It is therefore not interchangeable with the in-degree calculated from `citations_filtered.parquet`.
 
-Column: question_type
-Type: string
-Semantics: Clause category (e.g., Governing Law)
+The source documentation treats `precedential_status` as the field for filtering to published opinions. It should not be treated as a universal legal conclusion about whether an opinion is binding in every jurisdiction; jurisdiction-specific precedent rules are outside the scope of this dataset schema.
 
-Why it is domain-adjacent, not domain-matched. Contracts are legal text but not case law. The ablation measures a chunker property (does the passage survive chunking?) that is independent of document type. Using contracts avoids contamination with the case-law corpus while still exercising legal-text structure (nested clauses, cross-references, numeric provisions).
+### 4.3 Cleaning notes
 
-What it proves: Delta Recall@5 between fixed-size and hierarchical chunkers. Not a legal RAG quality claim; a chunker quality claim.
+The upstream CSV is described as containing multi-line fields and field-shifted physical rows. The documented cleaning rule accepts a row when field 0 (the cluster ID) parses as a positive integer and drops rows that fail that check.
 
-### 7.2 Synthesized Citation-Lookup — eval_isolated/synthesized_graph_qa/
+The source reports the following snapshot-specific counts:
 
-Source: Derived from graph/citations_filtered.parquet — not downloaded. CC0 1.0 (derived).
+- Approximately 71.4 million physical CSV lines processed.
+- Approximately 10.2 million retained clean cluster records.
+- Approximately 14.3% retention from physical lines to retained records.
 
-Purpose: Provide deterministic ground truth for citation-lookup and precedent-traversal queries. Unlike a hand-labeled evaluation set, this set's answers are derivable from the graph itself, making it reproducible and auditable.
+These figures describe the reported cleaning run; they are not a general guarantee that the same parser will recover every future CourtListener snapshot. A new source snapshot should be checked for row counts, duplicate IDs, key coverage, and field completeness.
 
-queries.parquet — 200 rows
+The original build notes report no truncated `case_name` values among the 4,780 target clusters checked at `min` scale. Do not generalize that specific check to every future snapshot or scale without rerunning the validation.
 
-Column: query
-Type: string
-Semantics: Natural-language query (Find cases citing opinion {id})
+### 4.4 Scale
 
-Column: eval_type
-Type: string
-Semantics: citation_lookup
+| Preset | Cluster rows | Meaning |
+|---|---:|---|
+| `min` | 4,780 | Distinct selected cluster records reported for the 5,000-opinion corpus. |
+| `medium` | 92,157 | Distinct selected cluster records reported for the 100,000-opinion corpus. |
+| `max` | ~370,000 (estimated) | Estimated selected cluster records for the 400,000-opinion corpus. |
 
-Column: cited_opinion_id
-Type: int64
-Semantics: The target opinion
+These counts are cluster records, not opinions. The difference between corpus rows and cluster rows cannot be used to calculate the percentage of null `cluster_id` values: several opinions can share one cluster. The earlier source note reports approximately 0.3% of opinions with a null `cluster_id`, but that percentage must be confirmed with a direct null-count query against `opinions.parquet`; it is not derivable from the cluster-row counts above.
 
-Column: ground_truth_citing_ids
-Type: list of int64
-Semantics: Every citing_opinion_id for this target in the graph
+### 4.5 Uses and limits
 
-Column: ground_truth_count
-Type: int64
-Semantics: Length of the ground truth list
+The metadata file supports filtering by:
 
-Column: derivation
-Type: string
-Semantics: courtlistener_citation_map_set_membership — provenance of the ground truth
+- `precedential_status`.
+- `date_filed`.
+- `nature_of_suit`.
 
-Construction rule. For each of the top-200 most-cited opinions in the filtered graph, emit one query whose ground truth is the complete set of citing opinions. The query is a citation-lookup task: given a named case, return the full set of cases that cite it.
-
-Why this is a valid benchmark. The ground truth is not an opinion — it is a set membership test in citations_filtered.parquet. Any reviewer can re-derive the same ground truth from the same file. This is stronger than 100 hand-labeled queries because it eliminates labeler subjectivity.
-
-What it proves: Recall@K and NDCG@K for the graph retrieval arm. Also, hit rate of the adaptive router when it dispatches citation-lookup queries to the graph arm rather than dense retrieval.
-
-### 7.3 What These Two Sets Jointly Prove
-
-Metric: Chunking quality (Recall@5)
-Evaluated against: hojicha
-
-Metric: Graph retrieval quality (Recall@10, NDCG@10)
-Evaluated against: synthesized_graph_qa
-
-Metric: Citation precision
-Evaluated against: synthesized_graph_qa
-
-Metric: Router accuracy (graph vs. dense dispatch)
-Evaluated against: Both
-
-Metric: End-to-end latency
-Evaluated against: Both (per-route p50/p95)
-
-The two sets are intentionally complementary: hojicha isolates chunker behaviour from retrieval behaviour; synthesized_graph_qa isolates graph traversal correctness from dense semantic quality.
+It also supplies display and analysis fields such as `case_name`, `case_name_short`, `judges`, and `citation_count`. Court and jurisdiction filtering should use the corresponding opinion-level corpus fields unless the unshipped `dockets` and `courts` tables are added.
 
 ---
 
-## 8. Join Topology
+## 5. Evaluation data
 
-All datasets connect through two keys:
+Evaluation files live under `eval_isolated/` and are not part of the production opinion corpus. They should not be merged into production indexing data.
 
-    corpus.opinions.cl_opinion_id   <->  graph.citations.citing_opinion_id
-    corpus.opinions.cl_opinion_id   <->  graph.citations.cited_opinion_id
+Two evaluation datasets are described below. They test different properties and should not be treated as interchangeable benchmarks.
 
-    corpus.opinions.cluster_id      <->  metadata.clusters.id
-    metadata.clusters.docket_id     ->   dockets.id         (not shipped)
-    dockets.court_id                ->   courts.id          (court metadata on corpus)
+### 5.1 Chunking ablation — Hojicha
 
-Referential integrity guarantees:
+**Path:** `eval_isolated/hojicha/`
+**Upstream:** Hugging Face dataset `feyninc/hojicha`, described as derived from CUAD legal contracts.
+**Declared license:** CC BY 4.0.
+**Purpose:** Compare chunking strategies using clause-identification questions and a required-passage field.
 
-Constraint: Every citations.citing_opinion_id is in corpus.cl_opinion_id
-Guaranteed by: Citation filter stage
+`corpus.parquet` contains 194 rows:
 
-Constraint: Every citations.cited_opinion_id is in corpus.cl_opinion_id
-Guaranteed by: Citation filter stage
+| Column | Type | Meaning |
+|---|---|---|
+| `title` | string | Contract identifier. |
+| `text` | string | Full contract text. |
 
-Constraint: Every clusters.id is in corpus.cluster_id
-Guaranteed by: Cluster filter stage
+`questions.parquet` contains 1,568 rows:
 
-Constraint: corpus.cluster_id may be NULL
-Guaranteed by: Upstream; ~0.3% of opinions
+| Column | Type | Meaning |
+|---|---|---|
+| `question` | string | Clause-identification question. |
+| `document_title` | string | Links the question to a contract row. |
+| `chunk-must-contain` | string | Required ground-truth passage that must be present in a retrieved chunk. |
+| `question_type` | string | Clause category, for example Governing Law. |
 
-These guarantees hold at every scale. The filter stages are the mechanism: they run set() membership tests against the sampled corpus, dropping any upstream record whose key is not present. There is no partial-coverage scenario where a graph edge points to a non-existent corpus row.
+This is a **domain-adjacent** chunking benchmark: the documents are contracts, not case-law opinions. Its stated purpose is to test whether chunking preserves a required passage. A reported metric is Recall@5, comparing fixed-size and hierarchical chunkers. Results should be described as chunking results on this dataset, not as evidence of end-to-end case-law RAG quality.
 
----
+### 5.2 Synthesized direct citation-lookup set
 
-## 9. Scale Presets
+**Path:** `eval_isolated/synthesized_graph_qa/queries.parquet`
+**Source:** Derived from `graph/citations_filtered.parquet`; not downloaded as an independent upstream dataset.
+**Declared license:** CC0 1.0 for the derived evaluation artifact.
+**Purpose:** Evaluate direct citation lookup using ground truth computed from the filtered citation graph.
 
-The three scales are not just row-count variations. They serve distinct engineering purposes, and each is the correct choice for a specific phase of the project.
+The file contains 200 rows. Its documented schema is:
 
-Scale min:
-Corpus: 5,000
-Graph: 1,951
-Clusters: 4,780
-Purpose: Pipeline smoke test. Verify end-to-end execution in ~3 minutes. Graph is too sparse for retrieval evaluation.
+| Column | Type | Meaning |
+|---|---|---|
+| `query` | string | Natural-language query of the form “Find cases citing opinion {id}”. |
+| `eval_type` | string | Task label; documented value is `citation_lookup`. |
+| `cited_opinion_id` | int64 | Opinion being cited (the lookup target). |
+| `ground_truth_citing_ids` | list<int64> | All `citing_opinion_id` values whose `cited_opinion_id` equals the target in the filtered graph. |
+| `ground_truth_count` | int64 | Number of IDs in `ground_truth_citing_ids`. |
+| `derivation` | string | Ground-truth derivation label; documented value is `courtlistener_citation_map_set_membership`. |
 
-Scale medium:
-Corpus: 100,000
-Graph: 426,462
-Clusters: 92,157
-Purpose: Demo scale. Smallest scale where 2-hop traversal has meaningful branching. Default for README examples and portfolio demos.
+The construction rule is to select the 200 most-cited target opinions in the filtered graph and emit one query per target. For a target `X`, the ground truth is the set of opinions `Y` for which the graph contains the edge `Y -> X`.
 
-Scale max:
-Corpus: 400,000
-Graph: ~1.7M
-Clusters: ~370,000
-Purpose: Portfolio claim. Supports "~2M vectors" without inflating chunk-per-document counts. Build time ~45 min.
+This is a deterministic **one-hop incoming-citation lookup** benchmark. The documented `eval_type` and ground-truth columns do not define a 2-hop precedent-chain benchmark, holding-question benchmark, or semantic-relevance benchmark. Such evaluations require separate query sets and ground-truth definitions.
 
-Do not evaluate at min. The 1,951 edges produce a graph where 2-hop traversal returns empty results for most queries. Any graph-vs-dense comparison at min scale is measuring noise.
+The graph-derived ground truth is reproducible from the same filtered graph and construction rule. It is not independent human annotation: the evaluation measures retrieval against the graph's own recorded edges.
 
-Do not ship a portfolio at min. The README claim should be tied to medium or max. min exists for CI.
+### 5.3 What the supplied evaluation data supports
 
----
+| Evaluation question | Dataset | Supported interpretation |
+|---|---|---|
+| Does a chunk contain the required passage? | Hojicha | Chunking passage-retention performance, reported as Recall@5. |
+| Can the system retrieve opinions that cite a specified opinion? | Synthesized citation lookup | Direct graph lookup, reported with metrics such as Recall@K and NDCG@K. |
 
-## 10. Technique to Dataset Mapping
-
-Each retrieval technique in the system uses specific datasets. This table documents which dataset supports which technique, so changes to one dataset can be traced to the techniques they affect.
-
-Technique: Dense retrieval
-Depends on: Corpus (text), embeddings
-Mechanism: ANN over chunk embeddings
-
-Technique: Sparse retrieval
-Depends on: Corpus (text, citation, title)
-Mechanism: BM25 / tsvector over chunks
-
-Technique: Hierarchical chunking
-Depends on: Corpus (text)
-Mechanism: Child/parent structure over opinion bodies
-
-Technique: Chunking ablation
-Depends on: hojicha (isolated)
-Mechanism: Compare chunkers by passage-retention Recall@5
-
-Technique: Graph traversal (1-hop)
-Depends on: citations_filtered
-Mechanism: Direct neighbors of a seed opinion
-
-Technique: Graph traversal (2-hop)
-Depends on: citations_filtered
-Mechanism: Neighbors of neighbors, cycle-safe
-
-Technique: Metadata filtering
-Depends on: clusters_filtered
-Mechanism: Pre-ANN filter by precedential_status, date_filed, nature_of_suit
-
-Technique: Adaptive routing
-Depends on: All four
-Mechanism: Classifier dispatches query to cheapest arm
-
-Technique: Citation-lookup eval
-Depends on: synthesized_graph_qa
-Mechanism: Set-membership ground truth
-
-Technique: Citation precision
-Depends on: synthesized_graph_qa + corpus
-Mechanism: Do returned cases have the claimed citation string
-
-Implication for changes: if clusters_filtered is dropped, techniques 7 and 8 lose their metadata prefilter — the router cannot honour precedential_status = Published queries. If citations_filtered is dropped, techniques 5, 6, 8, 9 all fail. If hojicha is dropped, technique 4 loses its ablation. The dataset table in section 3 is not documentation — it is the dependency graph for the retrieval system.
+The datasets do **not**, by themselves, define a complete router-accuracy benchmark, an end-to-end latency benchmark, a holding-quality benchmark, or a 2-hop precedent-chain benchmark. Those measurements may be part of the wider evaluation harness, but their query sets, labels, metrics, and protocol must be documented in the evaluation methodology rather than inferred from these two datasets.
 
 ---
 
-## 11. Provenance, Licensing, Attribution
+## 6. Join topology and integrity rules
 
-Dataset: Corpus
-Upstream: docketx/us-caselaw
-License: public-domain-edict-of-government
-Redistribution: Unrestricted (US government works)
+There are two separate join paths from the corpus:
 
-Dataset: Graph
-Upstream: CourtListener citation-map-2026-06-30
-License: Public Domain Mark 1.0
-Redistribution: Unrestricted
+```text
+Opinion-level joins
+-------------------
+corpus.opinions.cl_opinion_id
+    <-> graph.citations_filtered.citing_opinion_id
+    <-> graph.citations_filtered.cited_opinion_id
 
-Dataset: Metadata
-Upstream: CourtListener opinion-clusters-2026-06-30
-License: Public Domain Mark 1.0
-Redistribution: Unrestricted
+Cluster-level join
+------------------
+corpus.opinions.cluster_id
+    <-> metadata.clusters_filtered.id
 
-Dataset: Chunking eval
-Upstream: feyninc/hojicha
-License: CC BY 4.0
-Redistribution: Attribution required
+Optional upstream CourtListener path (not shipped)
+--------------------------------------------------
+metadata.clusters_filtered.docket_id -> dockets.id
+ dockets.court_id                     -> courts.id
+```
 
-Dataset: Synthesized eval
-Upstream: Derived from graph
-License: CC0 1.0
-Redistribution: Unrestricted (derived work)
+### 6.1 Required checks for each release
 
-Attribution requirements:
+| Check | Expected condition | How it is established |
+|---|---|---|
+| Graph source endpoint | Every `citing_opinion_id` resolves to a corpus `cl_opinion_id`. | Graph filter retains only edges whose source endpoint is in the sampled corpus. |
+| Graph target endpoint | Every `cited_opinion_id` resolves to a corpus `cl_opinion_id`. | Graph filter retains only edges whose target endpoint is in the sampled corpus. |
+| Cluster key direction | Every shipped `clusters_filtered.id` is referenced by a non-null corpus `cluster_id`. | Cluster filter selects clusters referenced by the sampled corpus. |
+| Cluster coverage | Every non-null corpus `cluster_id` has a metadata row, if complete metadata coverage is part of the release contract. | Verify with an anti-join; subset filtering alone does not prove the reverse direction. |
+| Corpus opinion-key cardinality | `cl_opinion_id` is unique if graph-to-corpus joins are intended to be one-to-one. | Verify after text-variant resolution. |
+| Null cluster IDs | Nulls are allowed in `corpus.cluster_id`. | Measure directly from the corpus; do not infer from cluster-row counts. |
 
-- hojicha is under CC BY 4.0. Any redistribution of eval_isolated/hojicha/ must include the attribution notice in DATA_SOURCES.md.
-- CourtListener bulk data is Public Domain Mark 1.0. No attribution required, but upstream URL should be cited for reproducibility.
-- docketx/us-caselaw derives from CourtListener and inherits the public-domain status of US court opinions.
+The graph filter description establishes both endpoint checks. The cluster filter description establishes that metadata rows are selected from cluster IDs referenced by the corpus; complete reverse coverage should still be asserted with an anti-join if consumers depend on it. Similarly, the one-row-per-opinion assumption should be checked after applying the text-variant selection policy.
 
-Snapshots are immutable. Each published scale corresponds to a git tag (v1.0-min, v1.0-medium, v1.0-max). Consumers pin by tag, not by branch. Upstream changes to docketx or CourtListener require a new tag, never an overwrite.
+A release validation should record at least:
 
----
+```sql
+-- Graph endpoint coverage
+SELECT COUNT(*)
+FROM graph.citations_filtered g
+LEFT JOIN corpus.opinions c
+  ON c.cl_opinion_id = g.citing_opinion_id
+WHERE c.cl_opinion_id IS NULL;
 
-## 12. Non-Shipped Artifacts
+SELECT COUNT(*)
+FROM graph.citations_filtered g
+LEFT JOIN corpus.opinions c
+  ON c.cl_opinion_id = g.cited_opinion_id
+WHERE c.cl_opinion_id IS NULL;
 
-The published snapshot contains only the six retrieval artifacts plus four metadata files. The following are deliberately excluded:
+-- Corpus opinions without a cluster ID
+SELECT COUNT(*)
+FROM corpus.opinions
+WHERE cluster_id IS NULL;
 
-Artifact: intermediate/citation_map.parquet
-Size: ~15 GB
-Reason for exclusion: Full 77M-row citation map before corpus filter. Rebuildable from upstream in ~4 minutes with lbzip2.
+-- Non-null corpus cluster IDs without metadata
+SELECT COUNT(DISTINCT c.cluster_id)
+FROM corpus.opinions c
+LEFT JOIN metadata.clusters_filtered m
+  ON m.id = c.cluster_id
+WHERE c.cluster_id IS NOT NULL
+  AND m.id IS NULL;
 
-Artifact: intermediate/clusters_clean.parquet
-Size: ~3.5 GB
-Reason for exclusion: Cleaned cluster metadata before corpus filter. Rebuildable in ~8 minutes.
+-- Duplicate opinion IDs (must be zero for a one-row-per-opinion contract)
+SELECT cl_opinion_id, COUNT(*) AS row_count
+FROM corpus.opinions
+GROUP BY cl_opinion_id
+HAVING COUNT(*) > 1;
+```
 
-Artifact: graph/citation-map-*.csv.bz2
-Size: 526 MB
-Reason for exclusion: Upstream compressed source. Rebuildable.
-
-Artifact: graph/citation-map-*.csv
-Size: 2.7 GB
-Reason for exclusion: Decompressed intermediate. Deleted immediately after Parquet conversion.
-
-Artifact: metadata/opinion-clusters-*.csv.bz2
-Size: 2.4 GB
-Reason for exclusion: Upstream compressed source. Rebuildable.
-
-Artifact: metadata/opinion-clusters-*.csv
-Size: 12 GB
-Reason for exclusion: Decompressed intermediate. Deleted immediately after clean-Parquet conversion.
-
-Total published at --scale medium: ~1.1 GB across 10 files.
-Total intermediates: ~36 GB.
-
-The 33x ratio is why the split exists — consumers download 1.1 GB; producers pay 36 GB once.
-
-Intermediates are excluded from MANIFEST.json and from upload_folder() via ignore_patterns. They live under intermediate/, which is also excluded from the manifest walk.
-
----
-
-## 13. Known Limitations
-
-Graph typing. The citation graph carries only CITES edges. There are no typed relationships (OVERRULES, DISTINGUISHES, CONFLICTS_WITH). This reflects the state of public legal datasets — typed precedent edges are proprietary (Shepard's, KeyCite) and not available in open data. Consequences:
-
-- Precedent validity queries ("is X still good law?") cannot be answered by graph traversal alone. They require secondary retrieval over corpus text.
-- Adaptive routing for validity queries falls back to dense retrieval, not graph traversal.
-
-Cluster metadata coverage. Approximately 0.3% of corpus opinions lack a cluster_id (typically very old records). These opinions remain in the corpus (indexed for retrieval) but are excluded from metadata-filtered queries.
-
-case_name HTML markup. For clusters whose upstream CSV row was fragmented by multi-line fields, case_name may contain residual HTML markup. This affects display strings only — join keys, filtering, and citation matching are unaffected. Verified at --scale min (all 4,780 clusters, 0 truncated names).
-
-Opinion date granularity. corpus.date reflects the opinion decision date. For temporal filtering at day granularity (e.g., "decisions on 2020-01-15"), this is authoritative. For week or year granularity, sub-day differences between opinion and cluster dates are immaterial.
-
-citation_count is corpus-independent. The value comes from CourtListener's full-corpus count, not the sampled corpus. It is a valid influence signal but should not be compared to in-degree of citations_filtered.parquet — the latter reflects only the sample.
-
-Synthesized eval scale. 200 queries is a valid deterministic benchmark but small relative to the corpus. Recall@K on 200 queries has wider confidence intervals than on 2,000. Users seeking statistical rigor should extend the eval set to at least 1,000 queries (trivial to do — the synthesis method is a single value_counts() call).
+Adapt table names and SQL syntax to the actual storage engine. The queries describe the checks; they are not evidence that a particular release has passed them. Store their results with the build manifest or validation report.
 
 ---
 
-## 14. Consumption Contract
+## 7. Scale presets
 
-Any code consuming this dataset should rely on the following guarantees.
+The presets represent different corpus sample sizes. Graph and metadata counts depend on filtering those upstream datasets to the selected corpus.
 
-Guaranteed:
+| Preset | Corpus opinions | Citation edges | Cluster rows | Intended use |
+|---|---:|---:|---:|---|
+| `min` | 5,000 | 1,951 | 4,780 | CI and end-to-end pipeline smoke tests. Not the preferred scale for retrieval-quality claims. |
+| `medium` | 100,000 | 426,462 | 92,157 | Default demo and README scale. |
+| `max` | 400,000 | ~1.7M (estimated) | ~370,000 (estimated) | Larger demonstration and scale testing. |
 
-1. All join keys preserve referential integrity (section 8)
-2. corpus.text is non-null and non-empty for every row
-3. citations_filtered endpoints are always in corpus.cl_opinion_id
-4. clusters_filtered.id values are always in corpus.cluster_id
-5. MANIFEST.json records SHA-256 and row count for every shipped file
-6. Files are Parquet with fixed schema (column names, types stable across scales)
+The scale values are snapshot-specific. In particular:
 
-Not guaranteed:
+- Corpus counts are opinion rows.
+- Graph counts are directed citation edges after both endpoints are filtered to the corpus.
+- Metadata counts are cluster records, not opinion rows.
+- Chunk counts and vector counts are separate derived quantities and are only estimates until measured from a completed chunk/index build.
 
-1. Row count stability across scales (by design — scales are different)
-2. Field completeness for optional columns (citation, opinion_type, judges, etc.)
-3. case_name HTML-freedom
-4. Cross-scale key overlap (min and max share some rows but not all)
-5. Upstream stability — new snapshots require new git tags
+Do not assume that `min` is a strict subset of `medium`, or that `medium` is a strict subset of `max`. The source documentation describes the sampling as stratified by opinion ID rather than cumulative.
 
-Do not:
-
-1. Cache path assumptions — the tree is stable, but the code should read from data/raw/ regardless of where it was cloned
-2. Assume min is a subset of medium is a subset of max — the sampling is stratified by opinion ID, not cumulative
-3. Merge eval_isolated/ into corpus/ for any reason — evaluation contamination is unrecoverable
+Use `min` to validate that the pipeline runs. Use `medium` or `max` for demonstrations and retrieval experiments, and report the chosen preset with every result. Do not infer 2-hop path availability or benchmark validity from row counts alone.
 
 ---
 
-## 15. Versioning
+## 8. Dataset-to-technique dependencies
 
-Each published snapshot is a git tag on Athithya117/adaptive-graphrag-datasets:
+| Technique | Required dataset or derived artifact | Dependency |
+|---|---|---|
+| Dense retrieval | Corpus plus chunk and embedding outputs | Opinion `text` is chunked; derived chunks are embedded and stored in the ANN index. |
+| Sparse retrieval | Corpus plus chunk/index outputs | Chunk text and selected lexical metadata, including title and citation where configured. |
+| Hierarchical chunking | Corpus | Opinion `text` is the source body. Chunk structure and token limits are defined in the chunking specification. |
+| Citation graph traversal (1-hop) | `citations_filtered.parquet` | Direct incoming or outgoing neighbors of an opinion ID. |
+| Citation graph traversal (2-hop) | `citations_filtered.parquet` | Neighbors-of-neighbors traversal; cycle handling and edge-direction semantics belong to the graph implementation. |
+| Metadata filtering | `clusters_filtered.parquet` plus corpus fields | Cluster fields such as `precedential_status`, `date_filed`, and `nature_of_suit`; opinion-level court and jurisdiction fields remain in the corpus. |
+| Chunking ablation | Hojicha evaluation files | Required-passage retention comparison between chunking strategies. |
+| Direct citation-lookup evaluation | `synthesized_graph_qa/queries.parquet` plus the same filtered graph | Set-membership ground truth for incoming citation edges. |
 
-    main          = latest uploaded scale (currently medium)
-    v1.0-min      = 5,000 corpus, 1,951 edges
-    v1.0-medium   = 100,000 corpus, 426,462 edges
-    v1.0-max      = 400,000 corpus, ~1.7M edges
-
-Breaking changes require a new tag. A breaking change is any of:
-
-- Column rename or type change in a shipped Parquet file
-- Removal of a join key
-- Change to the filtering semantics (e.g., dropping edges below depth threshold)
-- Change to the synthesis rule for synthesized_graph_qa
-
-Non-breaking changes (adding a column, adding rows without removing) may ship under the existing tag only if they are additive and the MANIFEST.json update is included. In practice, prefer a new tag — the cost of a new tag is near-zero, and the reproducibility benefit is high.
-
-Upstream drift. CourtListener publishes quarterly bulk snapshots. docketx/us-caselaw is rebuilt periodically. Any refresh of an upstream source requires a new tag: v1.1-min, v1.1-medium, v1.1-max. Do not re-upload under v1.0-*.
+The router's dispatch policy is an application-layer dependency over the retrieval capabilities. These datasets provide the underlying records, but the route classifier, cost model, and route-quality labels are not defined here.
 
 ---
 
-## 16. Summary Table
+## 9. Provenance, license declarations, and versioning
 
-Dataset: corpus/opinions.parquet
-Rows (medium): 100,000
-Bytes (medium): ~700 MB
-Joins to: (primary)
-Retrieval role: Dense, sparse, chunking
-Eval role: —
+The following provenance and license labels are those stated in the source dataset documentation. Verify the upstream license files and the repository's `DATA_SOURCES.md` before redistributing a refreshed snapshot.
 
-Dataset: graph/citations_filtered.parquet
-Rows (medium): 426,462
-Bytes (medium): ~15 MB
-Joins to: cl_opinion_id
-Retrieval role: Graph traversal
-Eval role: Citation-lookup truth
+| Dataset | Upstream/source | Declared license or status |
+|---|---|---|
+| Opinion corpus | `docketx/us-caselaw`, derived from CourtListener | `public-domain-edict-of-government` / public-domain US court opinions, as declared by the source documentation. |
+| Citation graph | CourtListener citation-map snapshot `2026-06-30` | Public Domain Mark 1.0. |
+| Cluster metadata | CourtListener opinion-clusters snapshot `2026-06-30` | Public Domain Mark 1.0. |
+| Hojicha evaluation | `feyninc/hojicha` | CC BY 4.0; attribution required. |
+| Synthesized citation evaluation | Derived from the filtered citation graph | CC0 1.0, as declared for the derived artifact. |
 
-Dataset: metadata/clusters_filtered.parquet
-Rows (medium): 92,157
-Bytes (medium): ~20 MB
-Joins to: cluster_id
-Retrieval role: Metadata filter
-Eval role: Bindingness filter
+Attribution requirements recorded for this project:
 
-Dataset: eval_isolated/hojicha/corpus.parquet
-Rows (medium): 194
-Bytes (medium): ~10 MB
-Joins to: —
-Retrieval role: —
-Eval role: Chunking ablation
+- Redistributing Hojicha files requires the CC BY 4.0 attribution notice in `DATA_SOURCES.md`.
+- CourtListener source URLs and snapshot identifiers should be retained for reproducibility even where the declared status does not require attribution.
+- The corpus provenance should identify `docketx/us-caselaw` and its CourtListener source snapshot.
 
-Dataset: eval_isolated/hojicha/questions.parquet
-Rows (medium): 1,568
-Bytes (medium): ~1 MB
-Joins to: —
-Retrieval role: —
-Eval role: Chunking ablation
+The source documentation describes immutable release tags:
 
-Dataset: eval_isolated/synthesized_graph_qa/queries.parquet
-Rows (medium): 200
-Bytes (medium): <1 MB
-Joins to: —
-Retrieval role: —
-Eval role: Graph retrieval eval
+```text
+v1.0-min
+v1.0-medium
+v1.0-max
+```
 
-Total published: ~750 MB at --scale medium.
+It also describes `main` as the latest uploaded scale. A consumer requiring reproducibility should pin an immutable tag and inspect that tag's manifest, rather than relying on a mutable branch name.
+
+A new upstream CourtListener or `docketx` snapshot should receive a new dataset version/tag. Do not overwrite an existing version with changed source data or changed filtering semantics.
+
+### 9.1 Breaking changes
+
+Treat the following as breaking changes:
+
+- Renaming or changing the type of a shipped column.
+- Removing or changing the meaning of a join key.
+- Changing graph filtering semantics, including any change to retained `depth` values.
+- Changing the text-variant selection policy in a way that changes corpus identity or row cardinality.
+- Changing the construction rule or ground-truth semantics for `synthesized_graph_qa`.
+
+Adding a nullable or otherwise backward-compatible column may be additive, but still requires an updated manifest and schema validation. Prefer a new version tag when a change could affect reproducibility.
 
 ---
+
+## 10. Excluded build intermediates
+
+The following intermediates are described as build-time artifacts and are not part of the published dataset tree:
+
+| Artifact | Reported size | Reason for exclusion |
+|---|---:|---|
+| `intermediate/citation_map.parquet` | ~15 GB | Full citation map before filtering to the selected corpus. Rebuildable from the upstream citation-map file. |
+| `intermediate/clusters_clean.parquet` | ~3.5 GB | Cleaned cluster data before filtering to corpus cluster IDs. |
+| `graph/citation-map-*.csv.bz2` | 526 MB | Compressed upstream source file. |
+| `graph/citation-map-*.csv` | 2.7 GB | Decompressed CSV intermediate used for Parquet conversion. |
+| `metadata/opinion-clusters-*.csv.bz2` | 2.4 GB | Compressed upstream source file. |
+| `metadata/opinion-clusters-*.csv` | 12 GB | Decompressed CSV intermediate used for cleaning and Parquet conversion. |
+
+The reported intermediate sizes sum to approximately 36 GB. The source documentation states that intermediates are excluded from `MANIFEST.json` and the dataset upload through ignore rules. The build/release process should verify the ignore configuration so that source CSVs and intermediate Parquet files are not accidentally published.
+
+---
+
+## 11. Known limitations
+
+### 11.1 Citation relation types
+
+The graph contains `CITES` edges only. It does not encode `OVERRULES`, `DISTINGUISHES`, or `CONFLICTS_WITH`. Queries about whether a case remains good law require analysis beyond this graph, such as retrieving and examining relevant opinion text or using a separate citator source.
+
+### 11.2 Cluster metadata coverage
+
+Opinions with a null `cluster_id` cannot join to cluster-level metadata. The source notes report an approximate 0.3% null rate, but the exact rate must be computed from the released corpus. Do not derive it by subtracting the cluster-row count from the opinion-row count, because multiple opinions can share a cluster.
+
+### 11.3 Case-name formatting
+
+The source build notes identify possible HTML fragments in `case_name` from irregular upstream CSV rows. Treat case names as display strings that may require sanitization. Join keys and numeric filter fields should be validated independently. The reported no-truncation check at `min` scale is specific to that checked sample.
+
+### 11.4 Opinion date versus cluster date
+
+`corpus.date` and `clusters_filtered.date_filed` have different documented semantics. Temporal filters must state which date is authoritative for the use case. Do not silently mix the two fields.
+
+### 11.5 Corpus-wide versus sample-specific citation counts
+
+`clusters_filtered.citation_count` is described as an upstream corpus-wide count. Graph degree computed from `citations_filtered.parquet` is sample-specific. They are different measures and should not be compared as though they used the same population.
+
+### 11.6 Evaluation scope and sample size
+
+The synthesized set contains 200 direct citation-lookup queries derived from the filtered graph. It is reproducible, but it reflects the graph's own edge coverage and query-construction rule. Results should be reported with the query count and dataset version. It does not substitute for a separately labeled semantic, holding, or 2-hop precedent-chain evaluation.
+
+Hojicha contains 1,568 clause-identification questions over 194 contracts. Its domain is contracts rather than case law, so its results should remain scoped to chunking passage-retention behavior.
+
+---
+
+## 12. Consumer contract
+
+### 12.1 Release invariants to validate
+
+A release should not be described as conforming until its manifest and validation report establish the following:
+
+1. All six dataset Parquet files exist at the documented paths.
+2. Parquet schemas match the versioned schema contract.
+3. Every graph source and target opinion ID resolves to the corpus.
+4. Every shipped metadata cluster ID is referenced by the corpus; verify reverse coverage as well if consumers require metadata for every non-null corpus `cluster_id`.
+5. The intended cardinality of `cl_opinion_id` is verified after applying the text-variant policy.
+6. Null counts for `cluster_id` and optional fields are measured and recorded.
+7. `MANIFEST.json` records the hash and row count for each shipped Parquet file; record byte size as well if the release process supports it.
+8. Evaluation files remain isolated from production corpus and retrieval indexing.
+
+### 12.2 Consumer assumptions that are not guaranteed
+
+Consumers must not assume:
+
+- Exact row counts across scales.
+- Non-null values in optional metadata fields such as `citation`, `opinion_type`, `judges`, or `nature_of_suit`.
+- HTML-free case names.
+- That the `min`, `medium`, and `max` samples are cumulative subsets.
+- That upstream source data or schemas remain unchanged between snapshots.
+- That estimated chunk counts equal the number of chunks or vectors in a particular build.
+- That every opinion has a citation edge or that every graph traversal has a result.
+
+### 12.3 Consumer rules
+
+- Resolve dataset paths relative to the configured dataset root; do not assume a fixed checkout location.
+- Use `cl_opinion_id` for opinion-level graph joins and `cluster_id` for cluster-metadata joins.
+- Treat null `cluster_id` as a valid corpus state; define how metadata-filtered queries handle those opinions.
+- Keep `eval_isolated/` separate from production indexing.
+- Pin a version tag and retain its manifest when reproducing an experiment.
+
+---
+
+## 13. Medium-scale file-size reference
+
+The source documentation reports the following approximate sizes for the six dataset files at `medium` scale:
+
+| File | Rows | Approximate size |
+|---|---:|---:|
+| `corpus/opinions.parquet` | 100,000 | ~700 MB |
+| `graph/citations_filtered.parquet` | 426,462 | ~15 MB |
+| `metadata/clusters_filtered.parquet` | 92,157 | ~20 MB |
+| `eval_isolated/hojicha/corpus.parquet` | 194 | ~10 MB |
+| `eval_isolated/hojicha/questions.parquet` | 1,568 | ~1 MB |
+| `eval_isolated/synthesized_graph_qa/queries.parquet` | 200 | <1 MB |
+
+These rounded per-file figures sum to approximately 746 MB, or roughly 750 MB. The earlier source text also states that the complete published snapshot is approximately 1.1 GB across 10 files. That larger total is not explained by the six dataset-file sizes above. Do not publish both numbers as equivalent totals: use the actual release manifest to report either (a) the sum of the six dataset Parquet files or (b) the total size of all files in the release, and list what is included in the latter.
+
+---
+
+## 14. Summary
+
+| Dataset | Medium rows | Join key / relationship | Production or evaluation role |
+|---|---:|---|---|
+| `corpus/opinions.parquet` | 100,000 | `cl_opinion_id` for graph; `cluster_id` for metadata | Opinion text and opinion-level metadata; source for chunking and retrieval indexes. |
+| `graph/citations_filtered.parquet` | 426,462 | Both endpoint fields join to `cl_opinion_id` | Directed citation graph and direct citation-lookup ground truth. |
+| `metadata/clusters_filtered.parquet` | 92,157 | `id` joins to `cluster_id` | Cluster-level filtering and display metadata. |
+| `eval_isolated/hojicha/corpus.parquet` | 194 | `title` links to evaluation questions | Contract text for chunking ablation. |
+| `eval_isolated/hojicha/questions.parquet` | 1,568 | `document_title` links to contract `title` | Clause-identification questions and required-passage ground truth. |
+| `eval_isolated/synthesized_graph_qa/queries.parquet` | 200 | `cited_opinion_id` identifies graph target | Direct incoming-citation lookup evaluation. |
+
+**Operational rule:** Treat the corpus, graph, and metadata as distinct datasets with distinct keys. Treat evaluation data as isolated test material. Treat all row counts and file sizes as versioned snapshot values, and use the manifest and validation report—not estimates in prose—as the final release record.

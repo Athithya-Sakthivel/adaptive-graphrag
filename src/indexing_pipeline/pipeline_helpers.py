@@ -251,20 +251,45 @@ class Config:
 _WORKER_TOKENIZE: Callable[[str], int] | None = None
 
 
-def worker_init(model_dir_str: str) -> None:
-    """Load the embedder's tokenizer once per worker process."""
-    global _WORKER_TOKENIZE
-    try:
-        from transformers import AutoTokenizer
+def _make_tokenize(path_str: str) -> Callable[[str], int]:
+    """Return a closure that tokenizes with the tokenizer loaded from path_str.
 
-        tok = AutoTokenizer.from_pretrained(model_dir_str, local_files_only=True)
-        _WORKER_TOKENIZE = lambda t: len(tok.encode(t, add_special_tokens=True, truncation=False))
-    except Exception:
-        logger.exception(
-            "worker failed to load tokenizer from %s; falling back to heuristic",
-            model_dir_str,
-        )
-        _WORKER_TOKENIZE = None
+    The closure binds `tok` at call time of _make_tokenize, so the returned
+    function is independent of any loop variable in the caller.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(path_str, local_files_only=True)
+
+    def tokenize(text: str) -> int:
+        return len(tok.encode(text, add_special_tokens=True, truncation=False))
+
+    return tokenize
+
+
+def worker_init(model_dir_str: str, gpu_model_dir_str: str = "") -> None:
+    """Load the embedder's tokenizer once per worker process.
+
+    Tries model_dir first (CPU OpenVINO IR directory), then gpu_model_dir
+    (base HF checkpoint). On Kaggle only the GPU directory exists: model_dir
+    is the OpenVINO IR path, which is not downloaded there.
+    """
+    global _WORKER_TOKENIZE
+
+    candidates = [p for p in (model_dir_str, gpu_model_dir_str) if p]
+    for path_str in candidates:
+        try:
+            _WORKER_TOKENIZE = _make_tokenize(path_str)
+            logger.info("worker tokenizer loaded from %s", path_str)
+            return
+        except Exception:
+            continue
+
+    logger.error(
+        "worker failed to load tokenizer from any of %s; falling back to chars/4 heuristic",
+        candidates,
+    )
+    _WORKER_TOKENIZE = None
 
 
 def chunk_worker(
@@ -283,7 +308,7 @@ def chunk_worker(
         return -1, None, "missing cl_opinion_id", ""
     try:
         case_id = int(raw_id)
-    except TypeError, ValueError, OverflowError:
+    except (TypeError, ValueError, OverflowError):
         return -1, None, f"invalid cl_opinion_id: {raw_id!r}", ""
 
     try:
