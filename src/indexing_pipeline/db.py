@@ -274,7 +274,7 @@ VALIDATION_SQL: dict[str, str] = {
     """,
     "gate_3_boundary_integrity": """
         SELECT COALESCE(AVG(
-            CASE WHEN rtrim(text_original) ~ '[.!?…:](?:["”’)\\]])+)?$'
+            CASE WHEN rtrim(text_original) ~ '[.!?…:]["”’)\\\]]*$'
               THEN 0.0 ELSE 1.0 END
         ), 0.0)
         FROM public.chunks

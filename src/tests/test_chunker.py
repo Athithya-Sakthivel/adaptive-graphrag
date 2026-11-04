@@ -29,13 +29,17 @@ def test_is_noise_filters_children():
 
 
 def test_orphan_parent_prevented():
-    """A section whose entire body is noise emits neither parent nor child."""
-    # Non-asterisk text that survives v2.0's page-marker stripping.
-    # is_noise=lambda t: True filters every child; chunker must not emit
-    # a lone parent with no children, so it raises.
+    """If all children are filtered, the parent is dropped too."""
     r = _record(text="Paragraph one.\n\nParagraph two.")
     with pytest.raises(ChunkingError, match="no valid parent chunks"):
         chunk_opinion(r, is_noise=lambda t: True)
+
+
+def test_page_marker_only_text_raises():
+    """v2.0: text that is entirely page markers fails at _normalize."""
+    r = _record(text="* * *\n\n* * *\n\n* * *")
+    with pytest.raises(ChunkingError, match="empty text after HTML extraction"):
+        chunk_opinion(r)
 
 
 def test_parent_kept_when_any_child_survives():
