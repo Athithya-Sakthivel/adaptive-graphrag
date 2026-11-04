@@ -94,18 +94,34 @@ class IndexingPipeline:
         self._require_open()
         if self._embedder is None:
             if self.config.device.startswith("cuda"):
+                import torch
+
                 from .embedder import TorchEmbedder
 
+                # "cuda" → auto-detect; "cuda:N" → single GPU; "cuda:0,cuda:1" → explicit list
+                cfg_dev = self.config.device.strip()
+                if "," in cfg_dev:
+                    device: str | list[str] = [d.strip() for d in cfg_dev.split(",") if d.strip()]
+                elif cfg_dev == "cuda":
+                    device = "cuda"
+                else:
+                    device = cfg_dev
+
+                # Log GPU inventory for the run
+                gpu_count = torch.cuda.device_count()
                 logger.info(
-                    "loading TorchEmbedder device=%s model_dir=%s",
-                    self.config.device,
-                    self.config.gpu_model_dir,
+                    "CUDA devices available: %d (%s)",
+                    gpu_count,
+                    ", ".join(torch.cuda.get_device_name(i) for i in range(gpu_count))
+                    if gpu_count
+                    else "none",
                 )
+
                 self._embedder = TorchEmbedder(
                     model_dir=self.config.gpu_model_dir,
                     max_seq_length=self.config.max_seq_length,
-                    device=self.config.device,
-                    batch_size=max(self.config.embed_batch, 32),
+                    device=device,
+                    batch_size=self.config.embed_batch,
                 )
             else:
                 logger.info(
