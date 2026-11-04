@@ -308,7 +308,7 @@ def chunk_worker(
         return -1, None, "missing cl_opinion_id", ""
     try:
         case_id = int(raw_id)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError):  # fmt: skip
         return -1, None, f"invalid cl_opinion_id: {raw_id!r}", ""
 
     try:
