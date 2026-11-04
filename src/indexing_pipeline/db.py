@@ -10,8 +10,6 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import psycopg
-from pgvector import HalfVector
-from pgvector.psycopg import register_vector
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
@@ -351,6 +349,47 @@ class DatabaseError(Exception):
         super().__init__(reason if not detail else f"{reason}: {detail}")
 
 
+# ── Lazy pgvector loaders ───────────────────────────────────────────────
+# pgvector is only needed for insert (HalfVector) and connect
+# (register_vector). manifest / chunk / embed never touch it, so a broken
+# Kaggle pgvector must not break `import indexing_pipeline`.
+
+_HALF_VECTOR_CLASS: Any = None
+_REGISTER_VECTOR_FN: Any = None
+
+
+def _half_vector() -> Any:
+    global _HALF_VECTOR_CLASS
+    if _HALF_VECTOR_CLASS is None:
+        try:
+            from pgvector import HalfVector as _HV
+
+            _HALF_VECTOR_CLASS = _HV
+        except Exception as exc:
+            raise DatabaseError(
+                "pgvector import failed",
+                "install with: pip install 'pgvector>=0.3,<0.4'. "
+                f"Original error: {type(exc).__name__}: {exc}",
+            ) from exc
+    return _HALF_VECTOR_CLASS
+
+
+def _register_vector_fn() -> Any:
+    global _REGISTER_VECTOR_FN
+    if _REGISTER_VECTOR_FN is None:
+        try:
+            from pgvector.psycopg import register_vector as _rv
+
+            _REGISTER_VECTOR_FN = _rv
+        except Exception as exc:
+            raise DatabaseError(
+                "pgvector.psycopg import failed",
+                "install with: pip install 'pgvector>=0.3,<0.4'. "
+                f"Original error: {type(exc).__name__}: {exc}",
+            ) from exc
+    return _REGISTER_VECTOR_FN
+
+
 # ── Database ──────────────────────────────────────────────────────────────
 
 
@@ -394,7 +433,7 @@ class Database:
 
     @staticmethod
     def _configure_connection(conn: psycopg.Connection) -> None:
-        register_vector(conn)
+        _register_vector_fn()(conn)
 
     @staticmethod
     def _wrap(operation: str, exc: Exception) -> DatabaseError:
@@ -707,9 +746,10 @@ class Database:
             raise self._wrap("failed to load edges", exc) from exc
 
     @staticmethod
-    def _prepare_embedding(value: Any) -> HalfVector | None:
+    def _prepare_embedding(value: Any) -> Any:
         if value is None:
             return None
+        HalfVector = _half_vector()
         if isinstance(value, HalfVector):
             return value
         if hasattr(value, "tolist"):
