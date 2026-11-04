@@ -1,15 +1,9 @@
 repos:
-  # ---------------------------------------------------------------------------
-  # Secrets
-  # ---------------------------------------------------------------------------
   - repo: https://github.com/gitleaks/gitleaks
     rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # v8.30.1
     hooks:
       - id: gitleaks
 
-  # ---------------------------------------------------------------------------
-  # Repository hygiene
-  # ---------------------------------------------------------------------------
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
     hooks:
@@ -20,9 +14,6 @@ repos:
         args:
           - "--maxkb=10240"
 
-  # ---------------------------------------------------------------------------
-  # Python
-  # ---------------------------------------------------------------------------
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 01a675ea018f2fb714478a5ffb83fcea8374bb06 # v0.15.21
     hooks:
@@ -32,4 +23,10 @@ repos:
         files: ^src/.*\.py$
 
       - id: ruff-format
+        files: ^src/.*\.py$
+
+  - repo: https://github.com/DetachHead/basedpyright-pre-commit-mirror
+    rev: 1.39.6 # v1.39.6
+    hooks:
+      - id: basedpyright
         files: ^src/.*\.py$
