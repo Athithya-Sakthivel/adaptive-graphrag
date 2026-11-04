@@ -61,12 +61,32 @@ rm -f /workspace/tmp/data/embedded/_manifest.jsonl
 rm -f /workspace/tmp/data/embedded/*.jsonl
 
 
-export CORPUS_ROWS=50 && export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
+sudo apt update
+sudo apt install -y python3.14-dev build-essential
+
+git add . && git commit -m "new"
+pytest src/tests
+
+find . -type d -name "__pycache__" -exec rm -rf {} +
+
+export CORPUS_ROWS=5 && export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
 cd /workspace/src
 source .venv/bin/activate
+pip install -r indexing_pipeline/requirements.txt -q
 python3 -m indexing_pipeline.cli all --log-level INFO
-python3 -m indexing_pipeline.cli validate --log-level INFO
-python3 -m indexing_pipeline.cli index --log-level INFO
+
+
+# In a separate terminal, keep the .venv active
+cd /workspace
+source /workspace/src/utils/.venv/bin/activate
+python3 src/utils/inspect_chunks.py \
+  --chunked-dir /workspace/tmp/data/chunked \
+  --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16
+
+
+cd /workspace
+source /workspace/src/utils/.venv/bin/activate
+python3 src/utils/inspect_graph.py
 
 
 mkdir -p /workspace/src/indexing_pipeline/embedder

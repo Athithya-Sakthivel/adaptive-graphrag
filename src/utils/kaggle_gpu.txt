@@ -2,13 +2,25 @@
 # Block 2 — self-contained GPU block: clone, download, chunk, embed, upload
 # Accelerator: GPU T4 x2 (Settings → Accelerator → Save; session restarts)
 # Works even if /kaggle/working was wiped on restart.
+#
+# Uses --device cuda:0 (single GPU). For 200-2,400 texts, single-GPU with
+# FP16 is faster than the multi-GPU pool: the pool's ~20 s startup exceeds
+# any parallel gain, and the pool's CUDA-context interaction with
+# empty_cache() can deadlock on tail batches below MULTI_GPU_MIN_TEXTS.
+#
+# Verifies ALL five required fixes on origin/main before running:
+#   1. pipeline_helpers.py: parenthesized except clause
+#   2. pipeline_helpers.py: worker_init accepts gpu_model_dir_str
+#   3. pipeline.py: initargs passes both model_dir and gpu_model_dir
+#   4. embedder.py: MULTI_GPU_MIN_TEXTS = 20_000
+#   5. embedder.py: empty_cache() guarded behind self._pool is None
 # ════════════════════════════════════════════════════════════════════
 import os
 import sys
 import subprocess
 
 # ── Secrets ─────────────────────────────────────────────────────────
-os.environ["HF_TOKEN"]     = "hf_..i"           # ← your write token
+os.environ["HF_TOKEN"]     = "hf_...."           # ← your write token
 os.environ["HF_USER_NAME"] = "Athithya117"
 assert os.environ["HF_TOKEN"].startswith("hf_"), "HF_TOKEN not set"
 
@@ -18,6 +30,7 @@ CORPUS_ROWS     = "200"
 BASE_MODEL_ID   = "Hanno-Labs/dinghy-law-0.6b-v1"
 CHUNK_WORKERS   = "3"
 EMBED_BATCH_GPU = "128"
+EMBED_DEVICE    = "cuda:0"
 REPO_ARTIFACTS  = f"{os.environ['HF_USER_NAME']}/legalrag-artifacts"
 
 DATA     = "/kaggle/working/tmp/data"
@@ -25,6 +38,7 @@ GPU      = "/kaggle/working/models/dinghy-law-0.6b-v1"
 REPO     = "/kaggle/working/adaptive-graphrag"
 HELPERS  = f"{REPO}/src/indexing_pipeline/pipeline_helpers.py"
 PIPELINE = f"{REPO}/src/indexing_pipeline/pipeline.py"
+EMBEDDER = f"{REPO}/src/indexing_pipeline/embedder.py"
 
 def run(cmd: list[str], cwd: str | None = None) -> None:
     print(f"\n$ {' '.join(cmd)}")
@@ -39,27 +53,43 @@ sha = subprocess.check_output(
 ).strip()
 print(f"clone: {sha} (latest main)")
 
-# ── 2. Verify the three fixes ───────────────────────────────────────
+# ── 2. Verify all five required fixes ───────────────────────────────
 helpers_src  = open(HELPERS).read()
 pipeline_src = open(PIPELINE).read()
+embedder_src = open(EMBEDDER).read()
 
-missing = []
+missing: list[str] = []
 if "except (TypeError, ValueError, OverflowError):" not in helpers_src:
-    missing.append("except clause")
+    missing.append("pipeline_helpers: parenthesized except")
 if "def worker_init(model_dir_str: str, gpu_model_dir_str" not in helpers_src:
-    missing.append("worker_init signature")
+    missing.append("pipeline_helpers: worker_init gpu_model_dir_str")
 if "initargs=(str(self.config.model_dir), str(self.config.gpu_model_dir))" not in pipeline_src:
-    missing.append("initargs")
+    missing.append("pipeline: ProcessPoolExecutor initargs")
+if "MULTI_GPU_MIN_TEXTS = 20_000" not in embedder_src:
+    missing.append("embedder: MULTI_GPU_MIN_TEXTS = 20_000")
+if 'self.device.startswith("cuda") and self._pool is None' not in embedder_src:
+    missing.append("embedder: empty_cache guarded behind pool-is-None")
 
 if missing:
-    raise SystemExit(f"MISSING FIXES on origin/main: {missing}")
+    for m in missing:
+        print(f"MISSING FIX on origin/main: {m}")
+    raise SystemExit(
+        "origin/main is missing required fixes — push from laptop and re-run"
+    )
 
 subprocess.run(
     [sys.executable, "-c",
-     f"import ast; ast.parse(open('{HELPERS}').read()); ast.parse(open('{PIPELINE}').read())"],
+     f"import ast; "
+     f"ast.parse(open('{HELPERS}').read()); "
+     f"ast.parse(open('{PIPELINE}').read()); "
+     f"ast.parse(open('{EMBEDDER}').read())"],
     check=True,
 )
-print("fixes present: except, worker_init, initargs")
+print("fixes present: except, worker_init, initargs, "
+      "MULTI_GPU_MIN_TEXTS=20k, empty_cache guard")
+print(f"embed device: {EMBED_DEVICE} (single GPU)")
+
+!sudo apt update && sudo apt install -y python3.14-dev build-essential && pip install eyecite==2.7.8
 
 # ── 3. Install deps ─────────────────────────────────────────────────
 %pip install -q 'psycopg[binary]>=3.2,<4.0' 'psycopg-pool>=3.2,<4.0'
@@ -69,8 +99,9 @@ print("fixes present: except, worker_init, initargs")
 # ── 4. Verify GPU ───────────────────────────────────────────────────
 import torch
 print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"CUDA device count: {torch.cuda.device_count()}")
 if torch.cuda.is_available():
-    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print(f"Primary: {torch.cuda.get_device_name(0)}")
 assert torch.cuda.is_available(), "GPU not enabled — Settings → Accelerator → GPU T4 x2"
 
 # ── 5. Download raw corpus ──────────────────────────────────────────
@@ -83,7 +114,7 @@ print(f"parquet: ok ({os.path.getsize(parquet)/1e6:.1f} MB)")
 
 # ── 6. Download base model ──────────────────────────────────────────
 run(["hf", "download", BASE_MODEL_ID, "--local-dir", GPU])
-assert os.path.isfile(f"{GPU}/config.json"), f"model download failed: {GPU}"
+assert os.path.isfile(f"{GPU}/config.json"),    f"model download failed: {GPU}"
 assert os.path.isfile(f"{GPU}/tokenizer.json"), f"tokenizer missing: {GPU}"
 print("model: ok")
 
@@ -100,19 +131,21 @@ run([sys.executable, "-m", "indexing_pipeline.cli", "chunk",
      "--workers", CHUNK_WORKERS, "--force", "--log-level", "INFO"],
     cwd=f"{REPO}/src")
 
-# Verify chunked/ complete and token sizes
-import json, statistics
+# Verify chunked/ complete and every child under 512 real tokens
+import json
+import statistics
 from pathlib import Path
 from transformers import AutoTokenizer
 
 chunked_dir = f"{DATA}/chunked"
-assert os.path.isdir(chunked_dir)
+assert os.path.isdir(chunked_dir), f"chunked dir missing: {chunked_dir}"
+
 case_files = [f for f in os.listdir(chunked_dir)
               if f.endswith(".jsonl") and not f.startswith("_")]
 print(f"\nchunked case files: {len(case_files)}")
-assert len(case_files) > 0
-assert os.path.isfile(f"{chunked_dir}/_manifest.jsonl")
-assert not os.path.isfile(f"{chunked_dir}/_HALTED")
+assert len(case_files) > 0, "no chunked files produced"
+assert os.path.isfile(f"{chunked_dir}/_manifest.jsonl"), "chunked/_manifest.jsonl missing"
+assert not os.path.isfile(f"{chunked_dir}/_HALTED"), "chunk halted — check _failures.jsonl"
 
 fail_path = f"{chunked_dir}/_failures.jsonl"
 if os.path.isfile(fail_path):
@@ -121,7 +154,8 @@ if os.path.isfile(fail_path):
     assert n == 0, f"{n} chunk failures — resolve before embed"
 
 tok = AutoTokenizer.from_pretrained(GPU, local_files_only=True)
-tokens, over = [], []
+tokens: list[int] = []
+over:  list[tuple[str, int]] = []
 for p in sorted(Path(chunked_dir).glob("*.jsonl")):
     if p.name.startswith("_"):
         continue
@@ -138,20 +172,26 @@ print(f"children: {len(tokens)}  p50={statistics.median(tokens):.0f}  "
       f"p95={sorted(tokens)[int(.95*len(tokens))]:.0f}  max={max(tokens)}")
 assert len(over) == 0, f"{len(over)} chunks exceed 512 tokens — do not embed"
 
-# ── 8. Run embed on GPU ─────────────────────────────────────────────
-os.environ["DEVICE"] = "cuda"
+# ── 8. Run embed on GPU (single device) ─────────────────────────────
+os.environ["DEVICE"] = EMBED_DEVICE
 
 run([sys.executable, "-m", "indexing_pipeline.cli", "embed",
      "--data-dir", DATA, "--gpu-model-dir", GPU,
-     "--device", "cuda", "--embed-batch", EMBED_BATCH_GPU, "--log-level", "INFO"],
+     "--device", EMBED_DEVICE, "--embed-batch", EMBED_BATCH_GPU,
+     "--log-level", "INFO"],
     cwd=f"{REPO}/src")
 
 # ── 9. Verify embedded/ ─────────────────────────────────────────────
 embedded_dir = f"{DATA}/embedded"
+assert os.path.isdir(embedded_dir), f"embedded/ missing: {embedded_dir}"
+
 embedded_files = [f for f in os.listdir(embedded_dir)
                   if f.endswith(".jsonl") and not f.startswith("_")]
-assert len(embedded_files) == len(case_files)
-assert os.path.isfile(f"{embedded_dir}/_manifest.jsonl")
+print(f"\nembedded case files: {len(embedded_files)}  (chunked: {len(case_files)})")
+assert len(embedded_files) == len(case_files), (
+    f"mismatch: {len(embedded_files)} embedded vs {len(case_files)} chunked"
+)
+assert os.path.isfile(f"{embedded_dir}/_manifest.jsonl"), "embedded/_manifest.jsonl missing"
 
 fail_path = f"{embedded_dir}/_failures.jsonl"
 if os.path.isfile(fail_path):
@@ -159,14 +199,17 @@ if os.path.isfile(fail_path):
         n = sum(1 for _ in f)
     assert n == 0, f"{n} embed failures"
 
-# Sample vector sanity
+# Sample vector sanity: 1024 dims, L2-normalized
 with open(f"{embedded_dir}/{embedded_files[0]}") as f:
     vec = json.loads(f.readline())["vector"]
-assert len(vec) == 1024
-norm = sum(x*x for x in vec) ** 0.5
-assert abs(norm - 1.0) < 1e-3
+assert len(vec) == 1024, f"expected 1024 dims, got {len(vec)}"
+norm = sum(x * x for x in vec) ** 0.5
+assert abs(norm - 1.0) < 1e-3, f"vector not L2-normalized: norm={norm}"
+print(f"sample vector: dims={len(vec)}  L2 norm={norm:.4f}")
 
-# ── 10. Upload ──────────────────────────────────────────────────────
+# ── 10. Upload chunked/ + embedded/ to private HF dataset ───────────
+print(f"\nuploading to {REPO_ARTIFACTS} ...")
+
 subprocess.run(
     ["hf", "repo", "create", REPO_ARTIFACTS,
      "--repo-type", "dataset", "--private", "--exist-ok"],
@@ -184,15 +227,18 @@ run(["hf", "upload-large-folder", REPO_ARTIFACTS, DATA,
 
 # Verify upload
 from huggingface_hub import HfApi
+
 api = HfApi(token=os.environ["HF_TOKEN"])
 remote_files = list(api.list_repo_files(REPO_ARTIFACTS, repo_type="dataset"))
-remote_chunked  = sum(1 for f in remote_files if f.startswith("chunked/") and f.endswith(".jsonl"))
-remote_embedded = sum(1 for f in remote_files if f.startswith("embedded/") and f.endswith(".jsonl"))
+remote_chunked  = sum(1 for f in remote_files
+                      if f.startswith("chunked/")  and f.endswith(".jsonl"))
+remote_embedded = sum(1 for f in remote_files
+                      if f.startswith("embedded/") and f.endswith(".jsonl"))
 print(f"\nremote chunked: {remote_chunked}  embedded: {remote_embedded}")
-assert remote_chunked  >= len(case_files),      "chunked upload incomplete"
-assert remote_embedded >= len(embedded_files),  "embedded upload incomplete"
-assert "embedded/_manifest.jsonl" in remote_files
-assert "chunked/_manifest.jsonl"  in remote_files
+assert remote_chunked  >= len(case_files),     "chunked upload incomplete"
+assert remote_embedded >= len(embedded_files), "embedded upload incomplete"
+assert "embedded/_manifest.jsonl" in remote_files, "embedded/_manifest.jsonl not uploaded"
+assert "chunked/_manifest.jsonl"  in remote_files, "chunked/_manifest.jsonl not uploaded"
 
 print()
 print("✓ Block 2 complete.")
