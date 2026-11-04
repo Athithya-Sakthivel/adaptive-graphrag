@@ -493,7 +493,7 @@ class IndexingPipeline:
                 executor = concurrent.futures.ProcessPoolExecutor(
                     max_workers=self.config.workers,
                     initializer=worker_init,
-                    initargs=(str(self.config.model_dir),),
+                    initargs=(str(self.config.model_dir), str(self.config.gpu_model_dir)),
                 )
 
             try:

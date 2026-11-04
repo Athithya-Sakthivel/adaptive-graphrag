@@ -1,0 +1,125 @@
+# ════════════════════════════════════════════════════════════════════
+# Block 1 — clone, install, download, manifest + chunk
+# Accelerator: CPU or GPU (chunking is CPU-bound either way)
+# ════════════════════════════════════════════════════════════════════
+import os
+import sys
+import subprocess
+
+# ── Secrets (os.environ, never !export) ─────────────────────────────
+os.environ["HF_TOKEN"]     = "hf_a..."                 # ← replace with your write token
+os.environ["HF_USER_NAME"] = "Athithya117"
+assert os.environ["HF_TOKEN"].startswith("hf_"), "HF_TOKEN not set"
+
+# ── Config ──────────────────────────────────────────────────────────
+# DOWNLOAD_SCALE: what to fetch from HF — MUST be min|medium|max
+# CORPUS_ROWS:    what to process — min|medium|max OR any positive integer
+DOWNLOAD_SCALE  = "min"                             # for download_raw_data.py
+CORPUS_ROWS     = "200"                             # for the pipeline; "min" for full 5000
+EXPECTED_SHA    = "e1ba6c0"                         # ← your HEAD SHA
+BASE_MODEL_ID   = "Hanno-Labs/dinghy-law-0.6b-v1"
+CHUNK_WORKERS   = "3"
+
+assert DOWNLOAD_SCALE in {"min", "medium", "max"}, \
+    f"DOWNLOAD_SCALE must be min|medium|max, got {DOWNLOAD_SCALE!r}"
+if CORPUS_ROWS not in {"min", "medium", "max"}:
+    assert CORPUS_ROWS.isdigit() and int(CORPUS_ROWS) > 0, \
+        f"CORPUS_ROWS must be min|medium|max|positive int, got {CORPUS_ROWS!r}"
+
+DATA    = "/kaggle/working/tmp/data"
+GPU     = "/kaggle/working/models/dinghy-law-0.6b-v1"
+REPO    = "/kaggle/working/adaptive-graphrag"
+HELPERS = f"{REPO}/src/indexing_pipeline/pipeline_helpers.py"
+
+# ── Helper: run a command without shell expansion ───────────────────
+def run(cmd: list[str], cwd: str | None = None, label: str = "") -> None:
+    print(f"\n$ {' '.join(cmd)}")
+    subprocess.run(cmd, cwd=cwd, check=True, env=os.environ)
+
+# ── 1. Clone ────────────────────────────────────────────────────────
+%cd /kaggle/working
+subprocess.run(["rm", "-rf", REPO], check=True)
+run(["git", "clone", "https://github.com/Athithya-Sakthivel/adaptive-graphrag.git"])
+
+sha = subprocess.check_output(
+    ["git", "-C", REPO, "rev-parse", "--short", "HEAD"], text=True
+).strip()
+print(f"clone: {sha}  expect: {EXPECTED_SHA}")
+if not sha.startswith(EXPECTED_SHA):
+    print(f"WARN stale clone: {sha} != {EXPECTED_SHA}")
+
+# ── 2. Auto-patch Python-2 except syntax if present ─────────────────
+with open(HELPERS) as f:
+    src = f.read()
+before = "except TypeError, ValueError, OverflowError:"
+after  = "except (TypeError, ValueError, OverflowError):"
+if before in src:
+    with open(HELPERS, "w") as f:
+        f.write(src.replace(before, after))
+    print("patched: python-2 except -> python-3")
+subprocess.run(
+    [sys.executable, "-c", f"import ast; ast.parse(open('{HELPERS}').read())"],
+    check=True,
+)
+print("syntax: ok")
+
+# ── 3. Install deps ─────────────────────────────────────────────────
+%pip install -q 'psycopg[binary]>=3.2,<4.0' 'psycopg-pool>=3.2,<4.0'
+%pip install -q 'pgvector>=0.3,<0.4' 2>/dev/null || true
+%pip install -q 'openvino>=2026.4.1' 2>/dev/null || true   # only needed for CPU embed fallback
+
+# ── 4. Download raw corpus (DOWNLOAD_SCALE, not CORPUS_ROWS) ────────
+run([sys.executable, f"{REPO}/data/download_raw_data.py",
+     "--dir", f"{DATA}/raw",
+     "--scale", DOWNLOAD_SCALE,
+     "--force"],
+    cwd="/kaggle/working")
+
+assert os.path.isfile(f"{DATA}/raw/corpus/opinions.parquet"), \
+    f"download did not produce {DATA}/raw/corpus/opinions.parquet"
+print(f"parquet: ok ({os.path.getsize(f'{DATA}/raw/corpus/opinions.parquet')/1e6:.1f} MB)")
+
+# ── 5. Download base model ──────────────────────────────────────────
+run(["hf", "download", BASE_MODEL_ID, "--local-dir", GPU])
+assert os.path.isfile(f"{GPU}/config.json"), f"model download failed: {GPU}"
+print("model: ok")
+
+# ── 6. manifest + chunk ─────────────────────────────────────────────
+os.environ["CORPUS_ROWS"] = CORPUS_ROWS
+os.environ["DEVICE"]      = "cpu"
+
+run([sys.executable, "-m", "indexing_pipeline.cli", "manifest",
+     "--data-dir", DATA, "--gpu-model-dir", GPU, "--log-level", "INFO"],
+    cwd=f"{REPO}/src", label="manifest")
+
+run([sys.executable, "-m", "indexing_pipeline.cli", "chunk",
+     "--data-dir", DATA, "--gpu-model-dir", GPU,
+     "--workers", CHUNK_WORKERS, "--force", "--log-level", "INFO"],
+    cwd=f"{REPO}/src", label="chunk")
+
+# ── 7. Verify chunked/ complete ─────────────────────────────────────
+chunked_dir = f"{DATA}/chunked"
+assert os.path.isdir(chunked_dir), f"chunked dir missing: {chunked_dir}"
+
+case_files = [f for f in os.listdir(chunked_dir)
+              if f.endswith(".jsonl") and not f.startswith("_")]
+print(f"\nchunked case files: {len(case_files)}")
+assert len(case_files) > 0, "no chunked files produced"
+assert os.path.isfile(f"{chunked_dir}/_manifest.jsonl"), "chunked/_manifest.jsonl missing"
+assert not os.path.isfile(f"{chunked_dir}/_HALTED"), "chunk halted — check _failures.jsonl"
+
+fail_path = f"{chunked_dir}/_failures.jsonl"
+if os.path.isfile(fail_path):
+    with open(fail_path) as f:
+        n = sum(1 for _ in f)
+    print(f"chunk failures: {n}")
+    assert n == 0, "resolve chunk failures before switching to GPU"
+else:
+    print("chunk failures: 0")
+
+print()
+print("✓ Block 1 complete.")
+print()
+print("NEXT: Settings → Accelerator → GPU T4 x2 → Save")
+print("      (session restarts; /kaggle/working persists)")
+print("      Then run Block 2.")
