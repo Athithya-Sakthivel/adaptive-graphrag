@@ -24,6 +24,7 @@ logger = logging.getLogger("indexing_pipeline.cli")
 SUBCOMMANDS = (
     "manifest",
     "chunk",
+    "dedup",
     "embed",
     "load",
     "drop-index",
@@ -90,6 +91,138 @@ def _log_summary(value: Any) -> None:
     logger.info("pipeline stage summary", extra={"stage": "summary", "summary": payload})
 
 
+# ── Common flags ─────────────────────────────────────────────────────────
+
+
+def _add_common_flags(p: argparse.ArgumentParser) -> None:
+    """Add every flag that any subcommand may need.
+
+    All flags are on every subcommand for uniformity. The pipeline itself
+    ignores flags that don't apply to a stage (e.g. --dedup on `validate`),
+    so there is no risk of misuse — but there is also no per-command
+    restriction to maintain.
+    """
+    # Paths
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="override data directory (default: <repo>/tmp/data)",
+    )
+    p.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="override CPU model directory "
+        "(default: <package>/embedders/dinghy-law-0.6b-v1-openvino-fp16)",
+    )
+    p.add_argument(
+        "--gpu-model-dir",
+        type=Path,
+        default=None,
+        help="override GPU model directory — base HF checkpoint "
+        "(default: <package>/models/dinghy-law-0.6b-v1)",
+    )
+    p.add_argument(
+        "--db-dsn",
+        type=str,
+        default=None,
+        help="override DATABASE_URL",
+    )
+
+    # Corpus slice + tuning
+    p.add_argument(
+        "--corpus-rows",
+        type=str,
+        default=None,
+        help="min | medium | max | positive integer (overrides CORPUS_ROWS)",
+    )
+    p.add_argument("--workers", type=int, default=None, help="chunk worker processes (1..3)")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="parquet read batch size (default: 500)",
+    )
+    p.add_argument(
+        "--embed-batch",
+        type=int,
+        default=None,
+        help="per-batch texts passed to encode() (default: 64)",
+    )
+    p.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=None,
+        help="embedder max sequence length (default: 512)",
+    )
+    p.add_argument(
+        "--inference-threads",
+        type=int,
+        default=None,
+        help="OpenVINO CPU inference threads (default: 4)",
+    )
+    p.add_argument(
+        "--pool-min",
+        type=int,
+        default=None,
+        help="DB connection pool minimum (default: 1)",
+    )
+    p.add_argument(
+        "--pool-max",
+        type=int,
+        default=None,
+        help="DB connection pool maximum (default: 4)",
+    )
+    p.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="cpu (default) or cuda / cuda:0 / cuda:0,cuda:1",
+    )
+
+    # Execution control
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate wiring, write nothing",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="ignore skip logic and _HALTED markers",
+    )
+    p.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+    )
+    p.add_argument("--json-logs", action="store_true")
+
+    # Behavior toggles. BooleanOptionalAction gives us --foo / --no-foo pairs.
+    # default=None distinguishes "unset" from "explicit False" so Config
+    # defaults win when the user does not pass the flag.
+    p.add_argument(
+        "--dedup",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="cross-case dedup (default: enabled)",
+    )
+    p.add_argument(
+        "--noise-filter",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="drop provable-noise children in chunker (default: enabled)",
+    )
+    p.add_argument(
+        "--strict-tokenizer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="fail if a chunk worker cannot load a tokenizer "
+        "(default: enabled — prevents silent chars/2.25 fallback)",
+    )
+
+
 # ── Argparse ─────────────────────────────────────────────────────────────
 
 
@@ -103,56 +236,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     for name in SUBCOMMANDS:
         p = sub.add_parser(name, help=f"run the {name} stage")
-        p.add_argument(
-            "--data-dir",
-            type=Path,
-            default=None,
-            help="override data directory (default: <repo>/tmp/data)",
-        )
-        p.add_argument(
-            "--model-dir",
-            type=Path,
-            default=None,
-            help="override model directory (default: <package>/embedders/dinghy-law-0.6b-v1-openvino-fp16)",
-        )
-        p.add_argument(
-            "--db-dsn",
-            type=str,
-            default=None,
-            help="override DATABASE_URL",
-        )
-        p.add_argument(
-            "--corpus-rows",
-            type=str,
-            default=None,
-            help="min | medium | max | positive integer (overrides CORPUS_ROWS)",
-        )
-        p.add_argument("--workers", type=int, default=None)
-        p.add_argument("--batch-size", type=int, default=None)
-        p.add_argument("--embed-batch", type=int, default=None)
-        p.add_argument("--max-seq-length", type=int, default=None)
-        p.add_argument("--dry-run", action="store_true", help="validate wiring, write nothing")
-        p.add_argument("--force", action="store_true", help="ignore skip logic and _HALTED markers")
-        p.add_argument(
-            "--log-level",
-            choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-            default="INFO",
-        )
-        p.add_argument("--json-logs", action="store_true")
-
-        p.add_argument(
-            "--device",
-            type=str,
-            default=None,
-            help="cpu (default) or cuda / cuda:0 — overrides DEVICE",
-        )
-        p.add_argument(
-            "--gpu-model-dir",
-            type=Path,
-            default=None,
-            help="base HF checkpoint for CUDA embeddings "
-            "(default: <package>/models/dinghy-law-0.6b-v1)",
-        )
+        _add_common_flags(p)
 
     return parser
 
@@ -164,8 +248,13 @@ def _build_config(args: argparse.Namespace) -> pipeline.Config:
     """Build Config from env vars, then apply CLI overrides.
 
     Only DATABASE_URL and CORPUS_ROWS come from the environment.
-    Everything else uses the defaults defined in pipeline.py.
+    Everything else uses the defaults defined in pipeline_helpers.Config.
     CLI flags override env or defaults when supplied.
+
+    `None` values in the with_overrides call mean "leave unchanged". The
+    three BooleanOptionalAction toggles return None when unset, True when
+    --foo is passed, False when --no-foo is passed. Config defaults
+    survive when the flag was not mentioned.
     """
     config = pipeline.Config.from_env()
     return config.with_overrides(
@@ -178,9 +267,15 @@ def _build_config(args: argparse.Namespace) -> pipeline.Config:
         batch_size=args.batch_size,
         embed_batch=args.embed_batch,
         max_seq_length=args.max_seq_length,
+        inference_threads=args.inference_threads,
+        pool_min=args.pool_min,
+        pool_max=args.pool_max,
         device=args.device,
         dry_run=args.dry_run or None,
         force=args.force or None,
+        dedup_enabled=args.dedup,
+        noise_filter_enabled=args.noise_filter,
+        strict_worker_tokenizer=args.strict_tokenizer,
     )
 
 
@@ -193,6 +288,8 @@ def _dispatch(args: argparse.Namespace, pl: pipeline.IndexingPipeline) -> int:
             _log_summary(pl.manifest())
         elif args.command == "chunk":
             _log_summary(pl.chunk())
+        elif args.command == "dedup":
+            _log_summary(pl.dedup())
         elif args.command == "embed":
             _log_summary(pl.embed())
         elif args.command == "load":
@@ -214,7 +311,7 @@ def _dispatch(args: argparse.Namespace, pl: pipeline.IndexingPipeline) -> int:
         logger.error("%s", exc)
         if exc.reason == "halted":
             return EXIT_HALTED
-        if exc.reason == "gate_failed":
+        if exc.reason == "gate_failed" or exc.reason.startswith("gate_failed:"):
             return EXIT_GATE_FAILED
         if exc.reason.startswith("precondition"):
             return EXIT_PRECONDITION

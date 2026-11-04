@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""
-inspect_data.py — inspect data/raw/ before chunking at scale.
+"""inspect_data.py — inspect data/raw/ before chunking at scale.
 
-Every measurement uses the actual embedding tokenizer. Answers:
+Every measurement uses the actual embedding tokenizer (or chunker's
+2.25 chars/token fallback when no tokenizer is available). Answers:
 
   1. Are files present and schema-correct?
-  2. What is the real token ratio? (fallback sizing only; pipeline uses tokenize=)
-  3. Does _strip_html preserve paragraph breaks?  ← NEW, explains p50=1
+  2. What is the real token ratio?
+  3. Does _strip_html preserve paragraph breaks?
   4. What percentage of opinions have section hits?
-  5. Is the atomic filter applied inside _sentence_spans?  ← THE 3-BUG CHECK
-  6. What does chunk_opinion actually emit?  ← NEW, validates output
-  7. Do all graph edges resolve to real corpus opinions?  ← FULL corpus, not sample
+  5. Is the atomic filter applied inside _sentence_spans? (the 3-bug check)
+  6. What does chunk_opinion actually emit?
+  7. Do all graph edges resolve to real corpus opinions? (full corpus)
   8. Do all corpus clusters exist in metadata?
   9. Is eval isolated from production?
  10. What chunker config does this data justify?
@@ -39,11 +39,10 @@ import sys
 import time
 import warnings
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-# Make indexing_pipeline importable when running from src/utils/
 _REPO_SRC = Path(__file__).resolve().parent.parent
 if str(_REPO_SRC) not in sys.path:
     sys.path.insert(0, str(_REPO_SRC))
@@ -51,8 +50,6 @@ if str(_REPO_SRC) not in sys.path:
 import pandas as pd
 import pyarrow.parquet as pq
 
-# Silence HF tokenizer warnings ("sequence length > max"); we count tokens,
-# we do not run them through a model.
 warnings.filterwarnings("ignore", message=".*sequence length.*")
 warnings.filterwarnings("ignore", message=".*max_length.*")
 
@@ -84,23 +81,40 @@ if CHUNKER_AVAILABLE and chunker_mod is not None:
     _detect_sections = chunker_mod._detect_sections
     _strip_html = chunker_mod._strip_html
     _normalize = chunker_mod._normalize
+    _estimate_tokens = chunker_mod._estimate_tokens
+    EMBEDDER_MAX_TOKENS = chunker_mod.EMBEDDER_MAX_TOKENS
 else:
     PARENT_TARGET_TOK, PARENT_MAX_TOK, PARENT_MIN_TOK = 1000, 1400, 500
     CHILD_TARGET_TOK, CHILD_MAX_TOK, CHILD_MIN_TOK = 320, 400, 160
-    CHUNKER_CHARS_PER_TOKEN = 3.0
+    CHUNKER_CHARS_PER_TOKEN = 2.25
     CHUNKER_VERSION = f"fallback (chunker import failed: {_CHUNKER_IMPORT_ERROR})"
     COMPILED_SECTION_PATTERNS = ()
     ATOMIC_SPAN_PATTERNS = ()
-    _is_atomic_boundary = lambda text, pos: True
-    _sentence_spans = lambda text, s, e: [(s, e)]
-    _paragraph_spans = lambda text, s, e: [(s, e)]
-    _detect_sections = lambda text: [("body", 50, 0, len(text))]
-    _strip_html = lambda text, kind: text
-    _normalize = lambda text: text
+    EMBEDDER_MAX_TOKENS = 464
 
-# Embedder limits (must match embedder.py)
-EMBEDDER_MAX_TOKENS = 464  # OpenVINO STATIC_SEQUENCE
-EMBEDDER_TARGET_SEQ = 464  # same
+    def _is_atomic_boundary(text: str, pos: int) -> bool:  # noqa: ARG001
+        return True
+
+    def _sentence_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+        return [(start, end)]
+
+    def _paragraph_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+        return [(start, end)]
+
+    def _detect_sections(text: str) -> list[tuple[str, int, int, int]]:
+        return [("body", 50, 0, len(text))]
+
+    def _strip_html(text: str, text_kind: str) -> str:  # noqa: ARG001
+        return text
+
+    def _normalize(text: str) -> str:
+        return text
+
+    def _estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / CHUNKER_CHARS_PER_TOKEN))
+
 
 EXPECTED_FILES = [
     "corpus/opinions.parquet",
@@ -208,10 +222,7 @@ def pct(values: Sequence[float], p: float) -> float:
     return float(s[idx])
 
 
-def _make_token_counter(tok) -> Any:
-    """Bind tokenizer to a counter. Uses add_special_tokens=True so counts
-    match the pipeline's embedder-side validation."""
-
+def _make_token_counter(tok: Any) -> Callable[[str], int]:
     def count(text: str) -> int:
         if not text:
             return 0
@@ -237,8 +248,6 @@ def load_tokenizer(explicit: Path | None) -> Any:
         if c and (c / "tokenizer.json").is_file():
             try:
                 tok = AutoTokenizer.from_pretrained(str(c), local_files_only=True)
-                # Lift model_max_length so encode(..., truncation=False) never
-                # emits "sequence length > max" warnings on long opinions.
                 try:
                     tok.model_max_length = 1_000_000
                 except Exception:
@@ -253,7 +262,6 @@ def load_tokenizer(explicit: Path | None) -> Any:
 
 
 def load_sample_rows(root: Path, sample_size: int) -> tuple[list[dict], list[str]]:
-    """Load N sampled opinions, plus their (stripped+normalized) text."""
     cp = root / "corpus/opinions.parquet"
     if not cp.is_file():
         print(f"error: corpus missing: {cp}", file=sys.stderr)
@@ -362,7 +370,7 @@ def inspect_files_schema(root: Path) -> None:
 
 
 # ── Phase 2: token distribution ────────────────────────────────────────
-def inspect_tokens(texts: list[str], count_fn) -> dict:
+def inspect_tokens(texts: list[str], count_fn: Callable[[str], int]) -> dict:
     R.section("2. Token distribution (real tokenizer)")
 
     tokens = [count_fn(t) for t in texts]
@@ -393,7 +401,6 @@ def inspect_tokens(texts: list[str], count_fn) -> dict:
     R.check("chars/token p05", stats["ratio_p05"])
     R.check("chars/token p50", stats["ratio_p50"])
 
-    # Informational: pipeline passes tokenize=, so this is fallback-only.
     if CHUNKER_CHARS_PER_TOKEN > stats["ratio_min"]:
         R.finding(
             f"chunker.CHARS_PER_TOKEN={CHUNKER_CHARS_PER_TOKEN} > measured min "
@@ -412,7 +419,7 @@ def inspect_tokens(texts: list[str], count_fn) -> dict:
     return stats
 
 
-# ── Phase 3: HTML extraction health (explains paragraphs p50 = 1) ──────
+# ── Phase 3: HTML extraction health ────────────────────────────────────
 def inspect_html_health(rows: list[dict], max_per_kind: int = 3) -> None:
     R.section("3. HTML extraction health")
 
@@ -428,7 +435,6 @@ def inspect_html_health(rows: list[dict], max_per_kind: int = 3) -> None:
     R.check("text_kind varieties", {k: len(v) for k, v in by_kind.items()})
 
     for kind, kind_rows in by_kind.items():
-        # Per-opinion trace
         for i, row in enumerate(kind_rows[:max_per_kind]):
             raw = row.get("text") or ""
             try:
@@ -456,7 +462,6 @@ def inspect_html_health(rows: list[dict], max_per_kind: int = 3) -> None:
             )
             R.check(f"{kind}[{i}] paragraph spans", len(paras))
 
-        # Aggregate stats per kind
         para_counts: list[int] = []
         for row in kind_rows:
             try:
@@ -561,7 +566,6 @@ def inspect_sections(texts: list[str]) -> dict:
 
 # ── Phase 5: boundary protection ───────────────────────────────────────
 def _build_atomic_intervals(text: str) -> list[tuple[int, int]]:
-    """One pass over all patterns. Returns sorted, merged intervals."""
     intervals: list[tuple[int, int]] = []
     for pat in ATOMIC_SPAN_PATTERNS:
         for m in pat.finditer(text):
@@ -572,7 +576,7 @@ def _build_atomic_intervals(text: str) -> list[tuple[int, int]]:
     merged: list[tuple[int, int]] = [intervals[0]]
     for s, e in intervals[1:]:
         ls, le = merged[-1]
-        if s <= le:  # overlapping or touching
+        if s <= le:
             merged[-1] = (ls, max(le, e))
         else:
             merged.append((s, e))
@@ -580,12 +584,10 @@ def _build_atomic_intervals(text: str) -> list[tuple[int, int]]:
 
 
 def _pos_inside_intervals(intervals: list[tuple[int, int]], pos: int) -> bool:
-    """Binary search: is pos strictly inside any interval?"""
     if not intervals:
         return False
     import bisect
 
-    # Find the last interval whose start <= pos
     idx = bisect.bisect_right(intervals, (pos, float("inf"))) - 1
     if idx < 0:
         return False
@@ -601,25 +603,19 @@ def inspect_boundary_protection(texts: list[str], sample_size: int) -> dict:
     naive_total = naive_inside = 0
     chunker_total = chunker_inside = 0
     chunker_errors = 0
-
-    # Sample fewer opinions for this expensive check — 100 is statistically
-    # sufficient and 5x faster than 500.
     n_boundary = min(100, sample_size)
 
     for text in texts[:n_boundary]:
         if not text.strip():
             continue
 
-        # Precompute once: O(patterns × text_length) instead of O(boundaries × patterns × text_length)
         intervals = _build_atomic_intervals(text)
 
-        # Naive regex: count unprotected boundaries
         for m in naive_re.finditer(text):
             naive_total += 1
             if _pos_inside_intervals(intervals, m.start()):
                 naive_inside += 1
 
-        # Chunker's _sentence_spans: count unprotected boundaries
         try:
             spans = _sentence_spans(text, 0, len(text))
         except Exception:
@@ -675,7 +671,7 @@ def inspect_boundary_protection(texts: list[str], sample_size: int) -> dict:
 
 
 # ── Phase 6: paragraph structure ───────────────────────────────────────
-def inspect_paragraphs(texts: list[str], count_fn) -> dict:
+def inspect_paragraphs(texts: list[str], count_fn: Callable[[str], int]) -> dict:
     R.section("6. Paragraph / sentence structure")
 
     para_counts: list[int] = []
@@ -714,7 +710,7 @@ def inspect_paragraphs(texts: list[str], count_fn) -> dict:
         "sentence_tokens_p95": int(pct(sent_tokens, 0.95)),
         "sentence_tokens_max": int(max(sent_tokens)) if sent_tokens else 0,
         "oversized_sentences": oversized_sents,
-        "oversized_rate": round(oversized_sents / len(sent_tokens), 4) if sent_tokens else 0.0,
+        "oversized_rate": (round(oversized_sents / len(sent_tokens), 4) if sent_tokens else 0.0),
     }
 
     R.check("paragraphs/opinion p50", stats["paragraphs_p50"])
@@ -750,18 +746,15 @@ def inspect_paragraphs(texts: list[str], count_fn) -> dict:
 # ── Phase 7: chunker dry-run ───────────────────────────────────────────
 def inspect_chunker_dry_run(
     rows: list[dict],
-    tokenize,
-    count_fn,
+    tokenize: Callable[[str], int] | None,
+    count_fn: Callable[[str], int],
     sample_size: int,
 ) -> dict:
     R.section("7. Chunker dry-run (actual output validation)")
 
     if not CHUNKER_AVAILABLE or chunker_mod is None:
         R.check("chunker importable", "NO", ok=False)
-        R.finding(
-            f"cannot dry-run chunker: {_CHUNKER_IMPORT_ERROR}",
-            critical=True,
-        )
+        R.finding(f"cannot dry-run chunker: {_CHUNKER_IMPORT_ERROR}", critical=True)
         return {}
 
     if tokenize is None:
@@ -791,7 +784,7 @@ def inspect_chunker_dry_run(
         for c in children:
             if c.parent_id not in parent_ids:
                 orphans += 1
-            n = count_fn(c.text)  # full text = breadcrumb + body
+            n = count_fn(c.text)
             child_tokens.append(n)
             if n > EMBEDDER_MAX_TOKENS:
                 child_bad.append((c.chunk_id, n))
@@ -835,10 +828,7 @@ def inspect_chunker_dry_run(
             R.finding(f"chunk_opinion failed: case={case_id} {msg}", critical=True)
 
     if stats["orphans"] > 0:
-        R.finding(
-            f"{stats['orphans']} children reference non-existent parents",
-            critical=True,
-        )
+        R.finding(f"{stats['orphans']} children reference non-existent parents", critical=True)
 
     if stats["children_over_limit"] > 0:
         for cid, n in child_bad[:5]:
@@ -855,7 +845,7 @@ def inspect_chunker_dry_run(
     return stats
 
 
-# ── Phase 8: graph integrity (FULL corpus) ─────────────────────────────
+# ── Phase 8: graph integrity ───────────────────────────────────────────
 def inspect_graph(root: Path) -> dict:
     R.section("8. Citation graph integrity (against full corpus)")
 
@@ -901,7 +891,7 @@ def inspect_graph(root: Path) -> dict:
     return {"edges": len(g), "src_dangling": src_missing, "tgt_dangling": tgt_missing}
 
 
-# ── Phase 9: metadata coverage (FULL corpus) ───────────────────────────
+# ── Phase 9: metadata coverage ─────────────────────────────────────────
 def inspect_metadata(root: Path) -> dict:
     R.section("9. Cluster metadata coverage (against full corpus)")
 
@@ -1011,10 +1001,10 @@ def inspect_quality(texts: list[str]) -> dict:
     stats = {
         "total_paragraphs": total_paras,
         "duplicate_rate": round(dup_extra / total_paras, 4) if total_paras else 0.0,
-        "short_paragraph_rate": round(short_paras / total_paras, 4) if total_paras else 0.0,
-        "nonalpha_rate": round(nonalpha_paras / total_paras, 4) if total_paras else 0.0,
-        "html_residue_rate": round(html_residue / total_paras, 4) if total_paras else 0.0,
-        "unicode_density": round(unicode_chars / total_chars, 4) if total_chars else 0.0,
+        "short_paragraph_rate": (round(short_paras / total_paras, 4) if total_paras else 0.0),
+        "nonalpha_rate": (round(nonalpha_paras / total_paras, 4) if total_paras else 0.0),
+        "html_residue_rate": (round(html_residue / total_paras, 4) if total_paras else 0.0),
+        "unicode_density": (round(unicode_chars / total_chars, 4) if total_chars else 0.0),
     }
 
     R.check("total paragraphs", total_paras)
@@ -1061,7 +1051,6 @@ def derive_recommendations(
         R.finding("no tokenizer — cannot derive sizing recommendations", critical=False)
         return
 
-    # 1. CHARS_PER_TOKEN — informational only (pipeline uses tokenize=)
     if CHUNKER_CHARS_PER_TOKEN <= token_stats["ratio_p05"]:
         R.check(
             "CHARS_PER_TOKEN safe",
@@ -1076,7 +1065,6 @@ def derive_recommendations(
             critical=False,
         )
 
-    # 2. Child sizing vs embedding limit
     breadcrumb_est = 40
     if CHILD_MAX_TOK + breadcrumb_est <= EMBEDDER_MAX_TOKENS:
         R.check(
@@ -1092,7 +1080,6 @@ def derive_recommendations(
             critical=True,
         )
 
-    # 3. Section detection viability
     if section_stats:
         if section_stats["fallback_rate"] > 0.80:
             R.finding(
@@ -1107,7 +1094,6 @@ def derive_recommendations(
                 ok=True,
             )
 
-    # 4. Boundary protection
     if boundary_stats:
         if boundary_stats["chunker_inside"] > 0:
             R.finding(
@@ -1122,7 +1108,6 @@ def derive_recommendations(
                 ok=True,
             )
 
-    # 5. Chunker dry-run output
     if dry_run_stats and dry_run_stats.get("children_over_limit", 0) > 0:
         R.finding(
             f"dry-run: {dry_run_stats['children_over_limit']} children exceed embedding "
@@ -1130,14 +1115,12 @@ def derive_recommendations(
             critical=True,
         )
 
-    # 6. Quality warnings
     if quality_stats:
         if quality_stats["html_residue_rate"] > 0.01:
             R.finding("fix _strip_html before scaling", critical=True)
         if quality_stats["duplicate_rate"] > 0.05:
             R.finding("add MinHash dedup", critical=False)
 
-    # 7. Structure
     if structure_stats and structure_stats["paragraphs_p50"] <= 1:
         R.finding(
             f"p50 paragraphs/opinion = {structure_stats['paragraphs_p50']}. "
@@ -1147,8 +1130,13 @@ def derive_recommendations(
         )
 
 
-# ── Special mode: single opinion ───────────────────────────────────────
-def inspect_one(root: Path, case_id: int, tokenize, count_fn) -> int:
+# ── Single-opinion deep-dive ───────────────────────────────────────────
+def inspect_one(
+    root: Path,
+    case_id: int,
+    tokenize: Callable[[str], int],
+    count_fn: Callable[[str], int],
+) -> int:
     R.section(f"Single opinion: {case_id}")
 
     cp = root / "corpus/opinions.parquet"
@@ -1182,8 +1170,7 @@ def inspect_one(root: Path, case_id: int, tokenize, count_fn) -> int:
     paras = _paragraph_spans(normalized, 0, len(normalized))
     R.check("paragraph spans", len(paras))
     for i, (s, e) in enumerate(paras[:5]):
-        if count_fn:
-            R.check(f"  para {i} tokens", count_fn(normalized[s:e]))
+        R.check(f"  para {i} tokens", count_fn(normalized[s:e]))
 
     if CHUNKER_AVAILABLE and chunker_mod is not None:
         try:
@@ -1197,11 +1184,11 @@ def inspect_one(root: Path, case_id: int, tokenize, count_fn) -> int:
         R.check("parents", len(parents))
         R.check("children", len(children))
         for c in children[:10]:
-            n = count_fn(c.text) if count_fn else 0
+            n = count_fn(c.text)
             R.check(
                 f"  {c.chunk_id}",
                 f"{n} tokens, section={c.section}, body_chars={len(c.text_original)}",
-                ok=(n <= EMBEDDER_MAX_TOKENS) if n else None,
+                ok=(n <= EMBEDDER_MAX_TOKENS),
             )
 
     return 0
@@ -1257,19 +1244,22 @@ def main() -> int:
             print("error: no tokenizer loaded (--require-tokenizer)", file=sys.stderr)
             return 3
         print(
-            "WARNING: no tokenizer — token measurements will use fallback",
+            "WARNING: no tokenizer — token measurements use chunker's "
+            f"chars/{CHUNKER_CHARS_PER_TOKEN:.2f} fallback",
             file=sys.stderr,
         )
-        count_fn = lambda s: len(s) // 4
+        count_fn: Callable[[str], int] = _estimate_tokens
+        tokenize: Callable[[str], int] | None = None
     else:
         count_fn = _make_token_counter(tok)
+        tokenize = count_fn
 
     # Single-opinion deep dive
     if args.inspect_one is not None:
-        if tok is None:
+        if tok is None or tokenize is None:
             print("error: --inspect-one requires a tokenizer", file=sys.stderr)
             return 3
-        return inspect_one(root, args.inspect_one, tok, count_fn)
+        return inspect_one(root, args.inspect_one, tokenize, count_fn)
 
     # Sample for statistics
     rows, texts = load_sample_rows(root, args.sample)
@@ -1282,7 +1272,7 @@ def main() -> int:
             f"(chunker dry-run: {min(args.chunker_sample, len(rows))})"
         )
 
-    # Phase execution
+    # Phases
     inspect_files_schema(root)
     R.end()
 
@@ -1303,7 +1293,7 @@ def main() -> int:
 
     dry_run_stats = (
         inspect_chunker_dry_run(
-            rows, tok, count_fn, sample_size=min(args.chunker_sample, len(rows))
+            rows, tokenize, count_fn, sample_size=min(args.chunker_sample, len(rows))
         )
         if CHUNKER_AVAILABLE
         else {}

@@ -1,12 +1,38 @@
 """Pure algorithm — structure-aware chunking of court opinions.
 
 No I/O, no database, no model. Deterministic: same input + same tokenizer
-produce the same output.
++ same is_noise predicate + same token limit produce the same output.
 
 When a `tokenize` callable is provided, it is used for every size check so
 the chunk boundaries match the embedder's real tokenizer exactly. When
-omitted, a 3.0 chars/token heuristic is used (safe for citation-dense
-legal text).
+omitted, a 2.25 chars/token heuristic is used.
+
+v1.8 changes:
+  - Force-cuts snap backward to the nearest sentence boundary within
+    55% of the intended span (`_trim_to_sentence_end`).
+  - Overlap snap uses `backward_only=True`, preventing a forward snap
+    from creating a gap between chunks.
+
+v1.6 changes:
+  - Single newlines are no longer treated as paragraph boundaries.
+    Wrapped lines remain together; sentence splitting handles them.
+  - `max_embedding_tokens` is configurable per backend. Defaults to 464
+    for OpenVINO; callers may pass 512 for a verified PyTorch backend.
+  - Child-body budget is calculated from the actual breadcrumb size.
+    It never forces a minimum body size that exceeds the remaining budget.
+  - Post-emit validation checks against the selected backend limit.
+
+v1.5 changes:
+  - Optional `is_noise` callable on chunk_opinion. Applied to child bodies
+    only (not parents or breadcrumbs). Children identified as noise
+    are not emitted.
+  - Parent is emitted only if at least one child survives noise filtering.
+
+v1.4 changes:
+  - `_safe_cut` uses binary search whenever a tokenizer is provided.
+  - Breadcrumb headroom is reserved in the child token budget.
+  - Post-emit validation rejects children exceeding the token limit.
+  - CHARS_PER_TOKEN reduced from 3.0 to 2.25.
 """
 
 from __future__ import annotations
@@ -19,14 +45,21 @@ from html.parser import HTMLParser
 from typing import Any
 
 # ── Versioning ──────────────────────────────────────────────────────────
-# Bumped to v1.3 — atomic-span patterns expanded for case names, state
-# codes, honorifics, corporate suffixes, and state reporters. All previously
-# chunked output is invalidated.
 
-CHUNKER_VERSION = "chunk-v1.3"
+CHUNKER_VERSION = "chunk-v2.0"
 
 
-# ── Opinion-type mapping (CourtListener codes → canonical labels) ───────
+# ── Default embedder token limit ────────────────────────────────────────
+#
+# 464 is the current OpenVINO compiled sequence limit.
+# It is a default, not a universal transformer limit. Callers using a
+# verified backend with a different sequence length must pass that limit
+# through max_embedding_tokens to chunk_opinion().
+
+EMBEDDER_MAX_TOKENS = 464
+
+
+# ── Opinion-type mapping (CourtListener codes -> canonical labels) ──────
 
 OPINION_TYPE_MAP: dict[str, str] = {
     "020lead": "majority",
@@ -48,20 +81,19 @@ TEXT_KIND_PREFERENCE = (
 
 
 # ── Size budget (token counts) ──────────────────────────────────────────
-#
-# Observed chars/token on Alabama case law: min 3.13, p50 3.71, p95 4.02.
-# 3.0 gives ~5% safety margin below the observed minimum. The production
-# path passes a real tokenizer via chunk_opinion(tokenize=...) so this
-# heuristic is used only when the caller cannot supply one.
 
-CHARS_PER_TOKEN = 3.0
+# Observed chars/token on the target corpus with the dinghy tokenizer:
+# min 2.0, p05 2.25, p50 4.04. Dense citation blocks are the worst case.
+# This fallback is used only when no real tokenizer is supplied.
+
+CHARS_PER_TOKEN = 2.25
 
 PARENT_TARGET_TOK = 1000
 PARENT_MAX_TOK = 1400
 PARENT_MIN_TOK = 500
 
 CHILD_TARGET_TOK = 320
-CHILD_MAX_TOK = 400
+CHILD_MAX_TOK = 460
 CHILD_MIN_TOK = 160
 
 CHILD_OVERLAP_FALLBACK_TOK = 32
@@ -119,16 +151,12 @@ ATOMIC_SPAN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?"),  # $10,000
     re.compile(r"\b(?:19|20)\d{2}\b"),  # 1973
     re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),  # 06/15/2020
-    # ── Added in v1.3 to stop mid-citation and mid-name cuts ───────
-    # Case names: "Holyfield v. Moates", "Brown v. Board"
-    re.compile(r"\b[A-Z][A-Za-z']+\s+v\.\s+[A-Z][A-Za-z']+"),
-    # State code citations: "Ala. Code", "N.Y. Code", "Cal. Civ. Code"
-    re.compile(r"\b(?:[A-Z][a-z]*\.)+\s*Code\b"),
-    # Honorifics followed by a capitalised name: "Ms. Hilburn", "Dr. Ellis"
+    re.compile(
+        r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+[A-Z]"
+    ),  # Safeguard Business Sys., Inc. v. Smith
+    re.compile(r"\b(?:[A-Z][a-z]*\.)+\s*Code\b"),  # Ala. Code
     re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Hon|Prof|Rev|Gen|Col|Sgt|Capt|Lt|St)\.\s+[A-Z]"),
-    # Corporate suffixes: "Smith Co.", "ACME Inc.", "John Smith, Jr."
     re.compile(r"\b(?:Jr|Sr|Inc|Ltd|Co|Corp|LLC|L\.L\.C)\.(?:\s|$|,)"),
-    # State/regional reporters: "565 So.2d 186", "123 P.3d 456", "500 N.E.2d 100"
     re.compile(r"\d+\s+(?:So|P|A|N\.E|N\.W|S\.E|S\.W)\.\s*\d*[a-z]*\s+\d+"),
 )
 
@@ -149,9 +177,9 @@ class Chunk:
     case_id: int
     parent_id: str | None
     is_parent: bool
-    text: str  # breadcrumb + body  (for BM25 and display)
-    text_original: str  # body only           (for dense embedding + hashing)
-    text_hash: str  # sha256 of text_original
+    text: str
+    text_original: str
+    text_hash: str
     section: str
     section_path: str
     section_priority: int
@@ -288,6 +316,16 @@ def _normalize(text: str) -> str:
     )
     lines = [re.sub(r"[ \t\f\v]+", " ", line).strip() for line in text.split("\n")]
     text = "\n".join(lines)
+
+    # Strip CourtListener page markers and OCR page headers. These are
+    # source artifacts, not content. A chunk ending "...plaintiff.\n\n*84"
+    # is semantically complete; the *84 is CourtListener's page number.
+    #   *NNN                 → CourtListener page number
+    #   * Hi * Hi Hi *       → OCR page-header garbage
+    # Only standalone lines of ≤30 chars matching ^\*...\*$ are removed.
+    text = re.sub(r"(?m)^[ \t]*\*[\w \t*]{0,30}\*[ \t]*$\n?", "", text)
+    text = re.sub(r"(?m)^[ \t]*\*\d+[ \t]*$\n?", "", text)
+
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -300,13 +338,13 @@ def _map_opinion_type(raw: Any) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
+    """Estimate tokens for the no-tokenizer fallback path."""
     if not text:
         return 0
-    return max(1, (len(text) + 3) // 4)
+    return max(1, int(len(text) / CHARS_PER_TOKEN))
 
 
 def _measure(text: str, tokenize: Callable[[str], int] | None) -> int:
-    """Real tokenizer when provided, else char-based estimate."""
     if tokenize is not None:
         return tokenize(text)
     return _estimate_tokens(text)
@@ -335,7 +373,7 @@ def _make_breadcrumb(
 ) -> str:
     title_short = re.sub(r"\s+", " ", title).strip()
     if len(title_short) > 120:
-        title_short = title_short[:117].rstrip() + "..."
+        title_short = title_short[:57].rstrip() + "..."
 
     year_match = re.search(r"\b(?:19|20)\d{2}\b", date)
     year = year_match.group(0) if year_match else "date unknown"
@@ -381,11 +419,7 @@ def _snap_to_safe_boundary(
     *,
     backward_only: bool = False,
 ) -> int:
-    """Move pos out of any atomic span.
-
-    backward_only=True always moves the cut backward. This is used after
-    a size-based cut so snapping cannot push the boundary past the budget.
-    """
+    """Move pos out of any atomic span."""
     pos = max(0, min(pos, len(text)))
     for _ in range(16):
         changed = False
@@ -418,62 +452,118 @@ def _trim_span(text: str, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 
-def _paragraph_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+def _paragraph_spans(
+    text: str,
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
+    """Return paragraph spans without splitting wrapped single-newline text.
+
+    Double newlines are treated as paragraph separators. A single newline
+    is not sufficient evidence of a paragraph boundary: legal opinions
+    frequently contain hard-wrapped lines and line breaks inserted by
+    source extraction. Those lines remain in one span and are handled by
+    the sentence splitter or token-budget splitter.
+    """
     body = text[start:end]
 
-    # Primary: double-newline (paragraph) boundaries
-    if re.search(r"\n[ \t]*\n", body):
-        result: list[tuple[int, int]] = []
-        cursor = start
-        for match in re.finditer(r"\n[ \t]*\n+", body):
-            sep_start = start + match.start()
-            sep_end = start + match.end()
-            left, right = _trim_span(text, cursor, sep_start)
-            if left < right:
-                result.append((left, right))
-            cursor = sep_end
-        left, right = _trim_span(text, cursor, end)
+    if not re.search(r"\n[ \t]*\n", body):
+        return [(start, end)] if start < end else []
+
+    result: list[tuple[int, int]] = []
+    cursor = start
+
+    for match in re.finditer(r"\n[ \t]*\n+", body):
+        sep_start = start + match.start()
+        sep_end = start + match.end()
+        left, right = _trim_span(text, cursor, sep_start)
         if left < right:
             result.append((left, right))
-        return result
+        cursor = sep_end
 
-    # Fallback: single-newline boundaries (line-level split)
-    if "\n" in body:
-        result = []
-        cursor = start
-        for match in re.finditer(r"\n+", body):
-            sep_start = start + match.start()
-            sep_end = start + match.end()
-            left, right = _trim_span(text, cursor, sep_start)
-            if left < right:
-                result.append((left, right))
-            cursor = sep_end
-        left, right = _trim_span(text, cursor, end)
-        if left < right:
-            result.append((left, right))
-        return result
+    left, right = _trim_span(text, cursor, end)
+    if left < right:
+        result.append((left, right))
 
-    # Last resort: one span (whole opinion) — sentence splitter handles this
-    return [(start, end)] if start < end else []
+    return result
 
 
-def _sentence_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+def _sentence_spans(
+    text: str,
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
     result: list[tuple[int, int]] = []
     cursor = start
     body = text[start:end]
-    for match in re.finditer(r'(?<=[.!?])[\x22\x27\u201d\u2019)]*\s+(?=[A-Z0-9("])', body):
+
+    pattern = (
+        r"(?<=[.!?])[\x22\x27\u201d\u2019)]*"
+        r'\s+(?=[A-Z0-9("])'
+    )
+
+    for match in re.finditer(pattern, body):
         boundary = start + match.start()
-        # Skip boundaries that fall inside an atomic span
         if not _is_atomic_boundary(text, boundary):
             continue
+
         left, right = _trim_span(text, cursor, boundary)
         if left < right:
             result.append((left, right))
         cursor = start + match.end()
+
     left, right = _trim_span(text, cursor, end)
     if left < right:
         result.append((left, right))
+
     return result or [(start, end)]
+
+
+# Matches the end of a complete sentence: one of . ! ? … optionally
+# followed by closing quotes/brackets. Used by _trim_to_sentence_end to
+# decide whether a chunk already ends cleanly.
+_SENTENCE_END_RE = re.compile(r'[.!?…:](?:["”’)\]]+)?$')
+
+
+def _trim_to_sentence_end(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    min_ratio: float = 0.55,
+) -> int:
+    """Move `end` backward to the last sentence-terminal in the span.
+
+    Used by `_split_oversized` after a size-based cut. A chunk that ends
+    mid-sentence is semantically worse than one that ends a few tokens
+    short of the budget: the reader (and the embedder) sees an incomplete
+    thought.
+
+    Returns `end` unchanged when:
+      - the span already ends in punctuation, OR
+      - no sentence terminal exists within the last (1 - min_ratio) of
+        the span (avoids shrinking to near-empty just to hit a period).
+
+    `min_ratio` (0.55) means the trimmed chunk must retain at least 55%
+    of the intended size. Tuned empirically: 0.55 clears the <=2%
+    boundary-integrity gate without materially reducing effective chunk
+    size.
+    """
+    if end <= start:
+        return end
+
+    if _SENTENCE_END_RE.search(text[start:end].rstrip()):
+        return end
+
+    threshold = start + int((end - start) * min_ratio)
+    for i in range(end - 1, threshold - 1, -1):
+        if text[i] in ".!?":
+            j = i + 1
+            while j < end and text[j] in ")\"'\u201d\u2019]":
+                j += 1
+            return j
+
+    return end
 
 
 def _safe_cut(
@@ -483,20 +573,21 @@ def _safe_cut(
     max_tokens: int,
     tokenize: Callable[[str], int] | None,
 ) -> int:
-    """Return the largest position <= start + budget, on a word boundary,
-    not inside an atomic span.
-
-    With a real tokenizer, binary-search the largest cut whose measured
-    token count is <= max_tokens. Without one, cut at max_tokens ×
-    CHARS_PER_TOKEN characters and snap backward to a word boundary.
-    """
-    max_chars = int(max_tokens * CHARS_PER_TOKEN)
-    target = min(start + max_chars, end)
-    if target >= end:
+    """Return a cut position whose prefix is within max_tokens."""
+    if start >= end:
         return end
 
+    best: int | None = None
+
     if tokenize is not None:
-        lo, hi, best = start + 1, target, start + 1
+        if tokenize(text[start:end]) <= max_tokens:
+            return end
+
+        max_chars = int(max_tokens * 5.0)
+        search_end = min(start + max_chars, end)
+        lo, hi = start + 1, search_end
+        best = start + 1
+
         while lo <= hi:
             mid = (lo + hi) // 2
             if tokenize(text[start:mid]) <= max_tokens:
@@ -504,9 +595,17 @@ def _safe_cut(
                 lo = mid + 1
             else:
                 hi = mid - 1
-        target = best
 
-    # Snap backward to the nearest paragraph/sentence/word boundary.
+        target = best
+    else:
+        max_chars = int(max_tokens * CHARS_PER_TOKEN)
+        target = min(start + max_chars, end)
+        if target >= end:
+            return end
+
+    if target >= end:
+        return end
+
     low = start + max(1, int((target - start) * 0.70))
     for sep in ("\n\n", "\n", " "):
         pos = text.rfind(sep, low, target + 1)
@@ -514,11 +613,21 @@ def _safe_cut(
             target = pos
             break
 
-    # Atomic-boundary snap: backward only, so the size budget is respected.
-    target = _snap_to_safe_boundary(text, target, backward_only=True)
+    target = _snap_to_safe_boundary(
+        text,
+        target,
+        backward_only=True,
+    )
 
-    if target <= start or target > end:
-        target = min(start + max_chars, end)
+    if target <= start:
+        if best is not None:
+            target = best
+        else:
+            target = min(
+                start + int(max_tokens * CHARS_PER_TOKEN),
+                end,
+            )
+
     return max(start + 1, min(target, end))
 
 
@@ -533,23 +642,31 @@ def _split_oversized(
     result: list[tuple[int, int]] = []
     cursor = start
     overlap_chars = int(overlap_tokens * CHARS_PER_TOKEN)
+
     while cursor < end:
         if _measure(text[cursor:end], tokenize) <= max_tokens:
             left, right = _trim_span(text, cursor, end)
             if left < right:
                 result.append((left, right))
             break
+
         cut = _safe_cut(text, cursor, end, max_tokens, tokenize)
+        # Prefer a clean sentence boundary if one is nearby.
+        cut = _trim_to_sentence_end(text, cursor, cut, min_ratio=0.55)
         left, right = _trim_span(text, cursor, cut)
         if left < right:
             result.append((left, right))
+
         next_cursor = cut
         if overlap_chars:
             next_cursor = max(cursor + 1, cut - overlap_chars)
-            next_cursor = _snap_to_safe_boundary(text, next_cursor)
+            next_cursor = _snap_to_safe_boundary(text, next_cursor, backward_only=True)
+
         if next_cursor <= cursor:
             next_cursor = cut
+
         cursor = next_cursor
+
     return result
 
 
@@ -563,21 +680,36 @@ def _split_by_budget(
     overlap_tokens: int = 0,
     tokenize: Callable[[str], int] | None = None,
 ) -> list[tuple[int, int]]:
+    if max_tokens < 1:
+        return []
+
+    target_tokens = max(1, min(target_tokens, max_tokens))
+    min_tokens = max(1, min(min_tokens, max_tokens))
+
     paragraphs = _paragraph_spans(text, start, end)
     if not paragraphs:
         return []
 
     units: list[tuple[int, int]] = []
+
     for p_start, p_end in paragraphs:
         if _measure(text[p_start:p_end], tokenize) <= max_tokens:
             units.append((p_start, p_end))
             continue
+
         for s_start, s_end in _sentence_spans(text, p_start, p_end):
             if _measure(text[s_start:s_end], tokenize) <= max_tokens:
                 units.append((s_start, s_end))
             else:
                 units.extend(
-                    _split_oversized(text, s_start, s_end, max_tokens, overlap_tokens, tokenize)
+                    _split_oversized(
+                        text,
+                        s_start,
+                        s_end,
+                        max_tokens,
+                        overlap_tokens,
+                        tokenize,
+                    )
                 )
 
     if not units:
@@ -593,8 +725,14 @@ def _split_by_budget(
             current_end = unit_end
             continue
 
-        proposed_tokens = _measure(text[current_start:unit_end], tokenize)
-        current_tokens = _measure(text[current_start:current_end], tokenize)
+        proposed_tokens = _measure(
+            text[current_start:unit_end],
+            tokenize,
+        )
+        current_tokens = _measure(
+            text[current_start:current_end],
+            tokenize,
+        )
 
         should_flush = proposed_tokens > max_tokens or (
             proposed_tokens > target_tokens and current_tokens >= min_tokens
@@ -610,11 +748,11 @@ def _split_by_budget(
     if current_start is not None and current_end is not None:
         packed.append((current_start, current_end))
 
-    # Merge a small trailing fragment when it fits safely.
     if len(packed) >= 2:
         prev_start, prev_end = packed[-2]
         last_start, last_end = packed[-1]
         combined = text[prev_start:last_end]
+
         if (
             _measure(text[last_start:last_end], tokenize) < min_tokens
             and _measure(combined, tokenize) <= max_tokens
@@ -629,12 +767,17 @@ def _split_by_budget(
 
 def _extract_section_path(text: str) -> str:
     first_line = text.split("\n", 1)[0].strip()
-    match = re.match(r"^((?:[IVXLC]{1,4})(?:\.[A-Z])?(?:\.\d+)?)\s*\.", first_line)
+    match = re.match(
+        r"^((?:[IVXLC]{1,4})(?:\.[A-Z])?(?:\.\d+)?)\s*\.",
+        first_line,
+    )
     if match:
         return match.group(1)
+
     match = re.match(r"^(\d+(?:\.\d+)*)[.)]\s*", first_line)
     if match:
         return match.group(1)
+
     return ""
 
 
@@ -646,6 +789,7 @@ def _detect_sections(text: str) -> list[tuple[str, int, int, int]]:
         return []
 
     matches: dict[int, tuple[str, int]] = {}
+
     for name, priority, pattern in COMPILED_SECTION_PATTERNS:
         for match in pattern.finditer(text):
             pos = match.start()
@@ -669,6 +813,7 @@ def _detect_sections(text: str) -> list[tuple[str, int, int, int]]:
         left, right = _trim_span(text, section_start, section_end)
         if left >= right:
             continue
+
         name, priority = matches[section_start]
         sections.append((name, priority, left, right))
 
@@ -683,25 +828,22 @@ def _split_parents(
     sections: list[tuple[str, int, int, int]],
     tokenize: Callable[[str], int] | None,
 ) -> list[tuple[str, int, str, int, int]]:
-    # Group sections: a small (< PARENT_MIN_TOK) section merges into the
-    # previous group only if the previous group's LAST section, extended
-    # by this one, stays within 2 × PARENT_MAX_TOK. Measuring from the
-    # group's FIRST section (the old behaviour) rejected the merge whenever
-    # the group already contained a full-size body — which is exactly the
-    # case for a short judgment following a long majority opinion.
     groups: list[list[tuple[str, int, int, int]]] = []
 
     for section in sections:
         _, _, start, end = section
         section_tokens = _measure(text[start:end], tokenize)
+
         if groups and section_tokens < PARENT_MIN_TOK:
             prev_last_start = groups[-1][-1][2]
             if _measure(text[prev_last_start:end], tokenize) <= PARENT_MAX_TOK * 2:
                 groups[-1].append(section)
                 continue
+
         groups.append([section])
 
     parents: list[tuple[str, int, str, int, int]] = []
+
     for group in groups:
         start = group[0][2]
         end = group[-1][3]
@@ -714,6 +856,7 @@ def _split_parents(
             path = _extract_section_path(text[section[2] : section[3]])
             if path and path not in paths:
                 paths.append(path)
+
         section_path = ";".join(paths)
 
         spans = _split_by_budget(
@@ -726,23 +869,30 @@ def _split_parents(
             overlap_tokens=0,
             tokenize=tokenize,
         )
+
         for p_start, p_end in spans:
             parents.append((name, priority, section_path, p_start, p_end))
 
-    # Post-pass: merge any residual undersized parent into its predecessor
-    # when the combined span fits within PARENT_MAX_TOK. Catches cases where
-    # a small section could not merge at the group level because its
-    # predecessor was already at the size ceiling.
     if len(parents) >= 2:
         merged: list[tuple[str, int, str, int, int]] = [parents[0]]
+
         for parent in parents[1:]:
             prev_name, prev_priority, prev_path, prev_start, prev_end = merged[-1]
             name, priority, path, start, end = parent
+
             if _measure(text[start:end], tokenize) < PARENT_MIN_TOK:
                 if _measure(text[prev_start:end], tokenize) <= PARENT_MAX_TOK:
-                    merged[-1] = (prev_name, prev_priority, prev_path, prev_start, end)
+                    merged[-1] = (
+                        prev_name,
+                        prev_priority,
+                        prev_path,
+                        prev_start,
+                        end,
+                    )
                     continue
+
             merged.append(parent)
+
         parents = merged
 
     return parents
@@ -752,15 +902,32 @@ def _split_children(
     text: str,
     parent_start: int,
     parent_end: int,
+    breadcrumb_tokens: int,
     tokenize: Callable[[str], int] | None,
+    max_embedding_tokens: int,
 ) -> list[tuple[int, int]]:
+    """Split a parent into child bodies within the selected backend limit.
+
+    The child budget reserves the measured breadcrumb size plus two
+    additional tokens for boundary/tokenization variation. The available
+    body budget is never raised to CHILD_MIN_TOK: it may be smaller when
+    the breadcrumb is long or the backend limit is low.
+    """
+    body_budget = max_embedding_tokens - breadcrumb_tokens - 2
+    if body_budget < 1:
+        return []
+
+    body_max = min(CHILD_MAX_TOK, body_budget)
+    body_target = max(1, min(CHILD_TARGET_TOK, body_max - 20))
+    body_min = max(1, min(CHILD_MIN_TOK, body_max // 2))
+
     return _split_by_budget(
         text=text,
         start=parent_start,
         end=parent_end,
-        target_tokens=CHILD_TARGET_TOK,
-        max_tokens=CHILD_MAX_TOK,
-        min_tokens=CHILD_MIN_TOK,
+        target_tokens=body_target,
+        max_tokens=body_max,
+        min_tokens=body_min,
         overlap_tokens=CHILD_OVERLAP_FALLBACK_TOK,
         tokenize=tokenize,
     )
@@ -772,27 +939,51 @@ def _split_children(
 def chunk_opinion(
     record: dict[str, Any],
     tokenize: Callable[[str], int] | None = None,
+    is_noise: Callable[[str], bool] | None = None,
+    max_embedding_tokens: int = EMBEDDER_MAX_TOKENS,
 ) -> list[Chunk]:
     """Chunk one opinion record into parent + child chunks.
 
     Args:
-        record:   dict with cl_opinion_id, text, text_kind, opinion_type,
-                  title, citation, court, date.
-        tokenize: optional callable mapping a string to its token count in
-                  the embedder's tokenizer. When provided, all size checks
-                  use it exactly; when omitted, a 3.0 chars/token heuristic
-                  is used.
+        record: dict with cl_opinion_id, text, text_kind, opinion_type,
+            title, citation, court, date.
+        tokenize: optional callable mapping text to its token count using
+            the embedder's tokenizer. When omitted, a 2.25 chars/token
+            estimate is used.
+        is_noise: optional pure predicate applied to child bodies only.
+            Children for which it returns True are omitted. A parent is
+            omitted if all its children are filtered.
+        max_embedding_tokens: maximum token count permitted for the full
+            child text, including breadcrumb and body. Defaults to 464
+            for OpenVINO. Set to another value only when the selected
+            backend's actual sequence limit has been verified.
 
     Raises:
-        ChunkingError: on missing ID, empty text, or no producible chunks.
+        ChunkingError: on invalid input, no producible chunks, invalid
+            token limit, or any emitted child exceeding the selected
+            backend limit.
     """
+    if (
+        isinstance(max_embedding_tokens, bool)
+        or not isinstance(max_embedding_tokens, int)
+        or max_embedding_tokens < 1
+    ):
+        raise ChunkingError(
+            None,
+            f"max_embedding_tokens must be a positive integer, got {max_embedding_tokens!r}",
+        )
+
     raw_id = record.get("cl_opinion_id")
     if raw_id is None:
         raise ChunkingError(None, "missing cl_opinion_id")
+
     try:
         case_id = int(raw_id)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ChunkingError(None, f"invalid cl_opinion_id: {raw_id!r}") from exc
+        raise ChunkingError(
+            None,
+            f"invalid cl_opinion_id: {raw_id!r}",
+        ) from exc
 
     raw_text = record.get("text")
     if not isinstance(raw_text, str) or not raw_text.strip():
@@ -801,7 +992,10 @@ def chunk_opinion(
     text_kind = str(record.get("text_kind") or "plain_text")
     plain = _normalize(_strip_html(raw_text, text_kind))
     if not plain:
-        raise ChunkingError(case_id, "empty text after HTML extraction and normalization")
+        raise ChunkingError(
+            case_id,
+            "empty text after HTML extraction and normalization",
+        )
 
     canonical_type = _map_opinion_type(record.get("opinion_type"))
     title = str(record.get("title") or "")
@@ -811,6 +1005,7 @@ def chunk_opinion(
 
     sections = _detect_sections(plain)
     parents = _split_parents(plain, sections, tokenize)
+
     if not parents:
         raise ChunkingError(case_id, "could not produce a parent chunk")
 
@@ -835,7 +1030,81 @@ def chunk_opinion(
             opinion_type=canonical_type,
             section_path=section_path,
         )
-        parent_id = _make_chunk_id(case_id, canonical_type, section_index, -1)
+        parent_id = _make_chunk_id(
+            case_id,
+            canonical_type,
+            section_index,
+            -1,
+        )
+
+        breadcrumb_text = breadcrumb + "\n"
+        breadcrumb_tokens = _measure(breadcrumb_text, tokenize)
+
+        if breadcrumb_tokens + 2 >= max_embedding_tokens:
+            raise ChunkingError(
+                case_id,
+                "breadcrumb consumes the child token budget: "
+                f"{breadcrumb_tokens} breadcrumb tokens, "
+                f"{max_embedding_tokens} maximum",
+            )
+
+        child_spans = _split_children(
+            plain,
+            parent_start,
+            parent_end,
+            breadcrumb_tokens,
+            tokenize,
+            max_embedding_tokens,
+        )
+
+        # Build children first so a parent is never emitted without a
+        # surviving child after noise filtering.
+        section_children: list[Chunk] = []
+
+        for child_index, (child_start, child_end) in enumerate(child_spans):
+            child_body = plain[child_start:child_end].strip()
+            if not child_body:
+                continue
+
+            if is_noise is not None and is_noise(child_body):
+                continue
+
+            child_id = _make_chunk_id(
+                case_id,
+                canonical_type,
+                section_index,
+                child_index,
+            )
+
+            section_children.append(
+                Chunk(
+                    chunk_id=child_id,
+                    case_id=case_id,
+                    parent_id=parent_id,
+                    is_parent=False,
+                    text=f"{breadcrumb}\n{child_body}",
+                    text_original=child_body,
+                    text_hash=_hash_text(child_body),
+                    section=section_name,
+                    section_path=section_path,
+                    section_priority=section_priority,
+                    section_index=section_index,
+                    child_index=child_index,
+                    opinion_type=canonical_type,
+                    page_start=None,
+                    page_end=None,
+                    char_start=child_start,
+                    char_end=child_end,
+                    court=court,
+                    date=date,
+                    citation=citation,
+                    title=title,
+                    chunker_version=CHUNKER_VERSION,
+                )
+            )
+
+        if not section_children:
+            continue
 
         emitted.append(
             Chunk(
@@ -863,44 +1132,35 @@ def chunk_opinion(
                 chunker_version=CHUNKER_VERSION,
             )
         )
+        emitted.extend(section_children)
 
-        child_spans = _split_children(plain, parent_start, parent_end, tokenize)
-        for child_index, (child_start, child_end) in enumerate(child_spans):
-            child_body = plain[child_start:child_end].strip()
-            if not child_body:
-                continue
-            child_id = _make_chunk_id(case_id, canonical_type, section_index, child_index)
-
-            emitted.append(
-                Chunk(
-                    chunk_id=child_id,
-                    case_id=case_id,
-                    parent_id=parent_id,
-                    is_parent=False,
-                    text=f"{breadcrumb}\n{child_body}",
-                    text_original=child_body,
-                    text_hash=_hash_text(child_body),
-                    section=section_name,
-                    section_path=section_path,
-                    section_priority=section_priority,
-                    section_index=section_index,
-                    child_index=child_index,
-                    opinion_type=canonical_type,
-                    page_start=None,
-                    page_end=None,
-                    char_start=child_start,
-                    char_end=child_end,
-                    court=court,
-                    date=date,
-                    citation=citation,
-                    title=title,
-                    chunker_version=CHUNKER_VERSION,
-                )
-            )
-
-    if not any(c.is_parent for c in emitted):
+    if not any(chunk.is_parent for chunk in emitted):
         raise ChunkingError(case_id, "no valid parent chunks were emitted")
-    if not any(not c.is_parent for c in emitted):
+
+    if not any(not chunk.is_parent for chunk in emitted):
         raise ChunkingError(case_id, "no valid child chunks were emitted")
+
+    # Validate full child text, including breadcrumb, with the actual
+    # tokenizer. This is the final guard against backend sequence overflow.
+    if tokenize is not None:
+        oversized: list[tuple[str, int]] = []
+
+        for chunk in emitted:
+            if chunk.is_parent:
+                continue
+
+            token_count = tokenize(chunk.text)
+            if token_count > max_embedding_tokens:
+                oversized.append((chunk.chunk_id, token_count))
+
+        if oversized:
+            details = ", ".join(
+                f"{chunk_id}={token_count}" for chunk_id, token_count in oversized[:5]
+            )
+            raise ChunkingError(
+                case_id,
+                f"{len(oversized)} child(ren) exceed backend limit "
+                f"{max_embedding_tokens} tokens: {details}",
+            )
 
     return emitted
