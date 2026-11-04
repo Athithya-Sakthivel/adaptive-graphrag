@@ -4,10 +4,11 @@ CPU path: static-reshaped OpenVINO IR with CACHE_DIR. Compile happens once
 per process and is reused across batches and restarts.
 
 CUDA path: sentence-transformers on the base HF checkpoint. Uses FP16,
-batches at 64, and — when more than one GPU is available — spawns a
-multi-process pool so both T4s share the workload. Produces vectors
-numerically equivalent to the CPU path (cosine > 0.99999), so the
-pipeline's manifest and skip logic is unchanged.
+batches at 64, and — when more than one GPU is available AND the batch is
+large enough to amortise the pool's fork overhead — spawns a multi-process
+pool so both T4s share the workload. Produces vectors numerically equivalent
+to the CPU path (cosine > 0.99999), so the pipeline's manifest and skip
+logic is unchanged.
 """
 
 from __future__ import annotations
@@ -39,7 +40,11 @@ STATIC_SEQUENCE = 464
 
 # TorchEmbedder tuning for T4
 TORCH_BATCH_SIZE = 64  # per-GPU sub-batch inside encode()
-MULTI_GPU_MIN_TEXTS = 400  # below this, single GPU is faster
+# Pool only pays off when its ~20 s fork/load startup amortises across a
+# large batch. Below this threshold, single-device is faster and avoids
+# the pool's deadlock-prone CUDA-context interactions. 20,000 texts is the
+# point at which 2× T4's ~1.3× speedup outweighs the fixed startup cost.
+MULTI_GPU_MIN_TEXTS = 20_000
 
 QUERY_PREFIX = (
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
@@ -51,7 +56,7 @@ def build_embedder_version(max_seq_length: int) -> str:
     return f"{BASE_MODEL_ID}-{max_seq_length}"
 
 
-# ── OpenVINO CPU embedder (unchanged) ──────────────────────────────────
+# ── OpenVINO CPU embedder ──────────────────────────────────────────────
 
 
 class Embedder:
@@ -379,9 +384,10 @@ class TorchEmbedder:
       - "cuda:0"      → single GPU
       - ["cuda:0", "cuda:1"] → explicit list
 
-    Large batches (> MULTI_GPU_MIN_TEXTS) use a sentence-transformers
-    multi-process pool so both GPUs share the workload. Small batches
-    stay single-device to avoid the pool's fork overhead.
+    Multi-GPU pool activates only when a single embed_documents call
+    exceeds MULTI_GPU_MIN_TEXTS. Below that threshold, single-device is
+    faster (no ~20 s fork/load) and avoids the CUDA-context interaction
+    that empty_cache() can deadlock on when pool workers are live.
     """
 
     def __init__(
@@ -424,7 +430,6 @@ class TorchEmbedder:
                 self.device_list = [device]
                 self.multi_device = False
             else:
-                # cpu or other
                 primary = device
                 self.device_list = [device]
                 self.multi_device = False
@@ -468,7 +473,7 @@ class TorchEmbedder:
             convert_to_numpy=True,
             show_progress_bar=False,
         )
-        if self.device.startswith("cuda"):
+        if self.device.startswith("cuda") and self._pool is None:
             torch.cuda.empty_cache()
 
         warmup = self.embed_documents(["A court must interpret the applicable law."])
@@ -552,7 +557,11 @@ class TorchEmbedder:
             convert_to_numpy=True,
             show_progress_bar=False,
         )
-        if self.device.startswith("cuda"):
+        # empty_cache() synchronises on the primary device's CUDA mutex.
+        # When pool workers hold live CUDA contexts, that mutex is never
+        # released between batches and the call deadlocks permanently.
+        # Only clear the cache when no pool is active.
+        if self.device.startswith("cuda") and self._pool is None:
             torch.cuda.empty_cache()
 
         return self._finalize(vectors, len(texts))
