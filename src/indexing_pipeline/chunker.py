@@ -3,9 +3,10 @@
 No I/O, no database, no model. Deterministic: same input + same tokenizer
 produce the same output.
 
-When a `tokenize` callable is provided, it is used for every size check so the
-chunk boundaries match the embedder's real tokenizer exactly. When omitted,
-a 3.0 chars/token heuristic is used (safe for citation-dense legal text).
+When a `tokenize` callable is provided, it is used for every size check so
+the chunk boundaries match the embedder's real tokenizer exactly. When
+omitted, a 3.0 chars/token heuristic is used (safe for citation-dense
+legal text).
 """
 
 from __future__ import annotations
@@ -18,8 +19,11 @@ from html.parser import HTMLParser
 from typing import Any
 
 # ── Versioning ──────────────────────────────────────────────────────────
+# Bumped to v1.3 — atomic-span patterns expanded for case names, state
+# codes, honorifics, corporate suffixes, and state reporters. All previously
+# chunked output is invalidated.
 
-CHUNKER_VERSION = "chunk-v1.2"
+CHUNKER_VERSION = "chunk-v1.3"
 
 
 # ── Opinion-type mapping (CourtListener codes → canonical labels) ───────
@@ -46,9 +50,9 @@ TEXT_KIND_PREFERENCE = (
 # ── Size budget (token counts) ──────────────────────────────────────────
 #
 # Observed chars/token on Alabama case law: min 3.13, p50 3.71, p95 4.02.
-# 3.0 gives ~5% safety margin below the observed minimum. The alternative —
-# passing a real tokenizer via chunk_opinion(tokenize=...) — removes the
-# estimate entirely and is the recommended production path.
+# 3.0 gives ~5% safety margin below the observed minimum. The production
+# path passes a real tokenizer via chunk_opinion(tokenize=...) so this
+# heuristic is used only when the caller cannot supply one.
 
 CHARS_PER_TOKEN = 3.0
 
@@ -115,6 +119,17 @@ ATOMIC_SPAN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?"),  # $10,000
     re.compile(r"\b(?:19|20)\d{2}\b"),  # 1973
     re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),  # 06/15/2020
+    # ── Added in v1.3 to stop mid-citation and mid-name cuts ───────
+    # Case names: "Holyfield v. Moates", "Brown v. Board"
+    re.compile(r"\b[A-Z][A-Za-z']+\s+v\.\s+[A-Z][A-Za-z']+"),
+    # State code citations: "Ala. Code", "N.Y. Code", "Cal. Civ. Code"
+    re.compile(r"\b(?:[A-Z][a-z]*\.)+\s*Code\b"),
+    # Honorifics followed by a capitalised name: "Ms. Hilburn", "Dr. Ellis"
+    re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Hon|Prof|Rev|Gen|Col|Sgt|Capt|Lt|St)\.\s+[A-Z]"),
+    # Corporate suffixes: "Smith Co.", "ACME Inc.", "John Smith, Jr."
+    re.compile(r"\b(?:Jr|Sr|Inc|Ltd|Co|Corp|LLC|L\.L\.C)\.(?:\s|$|,)"),
+    # State/regional reporters: "565 So.2d 186", "123 P.3d 456", "500 N.E.2d 100"
+    re.compile(r"\d+\s+(?:So|P|A|N\.E|N\.W|S\.E|S\.W)\.\s*\d*[a-z]*\s+\d+"),
 )
 
 
@@ -572,7 +587,7 @@ def _split_by_budget(
     if current_start is not None and current_end is not None:
         packed.append((current_start, current_end))
 
-    # Merge a trailing fragment when it fits safely.
+    # Merge a small trailing fragment when it fits safely.
     if len(packed) >= 2:
         prev_start, prev_end = packed[-2]
         last_start, last_end = packed[-1]
@@ -645,19 +660,23 @@ def _split_parents(
     sections: list[tuple[str, int, int, int]],
     tokenize: Callable[[str], int] | None,
 ) -> list[tuple[str, int, str, int, int]]:
+    # Group sections: a small (< PARENT_MIN_TOK) section merges into the
+    # previous group only if the previous group's LAST section, extended
+    # by this one, stays within 2 × PARENT_MAX_TOK. Measuring from the
+    # group's FIRST section (the old behaviour) rejected the merge whenever
+    # the group already contained a full-size body — which is exactly the
+    # case for a short judgment following a long majority opinion.
     groups: list[list[tuple[str, int, int, int]]] = []
 
     for section in sections:
         _, _, start, end = section
         section_tokens = _measure(text[start:end], tokenize)
-        if (
-            groups
-            and section_tokens < PARENT_MIN_TOK
-            and _measure(text[groups[-1][0][2] : end], tokenize) <= PARENT_MAX_TOK * 2
-        ):
-            groups[-1].append(section)
-        else:
-            groups.append([section])
+        if groups and section_tokens < PARENT_MIN_TOK:
+            prev_last_start = groups[-1][-1][2]
+            if _measure(text[prev_last_start:end], tokenize) <= PARENT_MAX_TOK * 2:
+                groups[-1].append(section)
+                continue
+        groups.append([section])
 
     parents: list[tuple[str, int, str, int, int]] = []
     for group in groups:
@@ -686,6 +705,22 @@ def _split_parents(
         )
         for p_start, p_end in spans:
             parents.append((name, priority, section_path, p_start, p_end))
+
+    # Post-pass: merge any residual undersized parent into its predecessor
+    # when the combined span fits within PARENT_MAX_TOK. Catches cases where
+    # a small section could not merge at the group level because its
+    # predecessor was already at the size ceiling.
+    if len(parents) >= 2:
+        merged: list[tuple[str, int, str, int, int]] = [parents[0]]
+        for parent in parents[1:]:
+            prev_name, prev_priority, prev_path, prev_start, prev_end = merged[-1]
+            name, priority, path, start, end = parent
+            if _measure(text[start:end], tokenize) < PARENT_MIN_TOK:
+                if _measure(text[prev_start:end], tokenize) <= PARENT_MAX_TOK:
+                    merged[-1] = (prev_name, prev_priority, prev_path, prev_start, end)
+                    continue
+            merged.append(parent)
+        parents = merged
 
     return parents
 

@@ -277,11 +277,22 @@ VALIDATION_SQL: dict[str, str] = {
         FROM public.chunks
         WHERE is_parent = FALSE
     """,
+    # Gate 4 extended in v1.3: catches fragment cuts on federal reporters,
+    # state codes, case-name connectors, honorifics, and state reporters.
+    # Previously only matched "N U.S." — the "Ala.", "v.", "Ms." fragments
+    # all passed silently. This is the check that now validates the chunker
+    # v1.3 atomic-span patterns.
     "gate_4_citation_integrity": """
         SELECT COUNT(*)
         FROM public.chunks
         WHERE is_parent = FALSE
-          AND rtrim(text_original) ~ '[0-9]+[[:space:]]+U[.]S[.]$'
+          AND (
+                rtrim(text_original) ~ '[0-9]+[[:space:]]+U[.]S[.]$'
+             OR rtrim(text_original) ~ '(?:[A-Z][a-z]+[.][[:space:]]*)+$'
+             OR rtrim(text_original) ~ '\\bv[.][[:space:]]*$'
+             OR rtrim(text_original) ~ '\\b(?:Mr|Mrs|Ms|Dr|Hon|Prof|Rev|Gen|Col|Sgt|Capt|Lt|St)[.][[:space:]]*$'
+             OR rtrim(text_original) ~ '[0-9]+[[:space:]]+(?:So|P|A|N[.]E|N[.]W|S[.]E|S[.]W)[.][[:space:]]*[0-9]*$'
+          )
     """,
     "gate_5_size_distribution": """
         SELECT
@@ -931,7 +942,7 @@ class Database:
                     name="gate_4_citation_integrity",
                     passed=split_cites == 0,
                     value=split_cites,
-                    threshold="0 split U.S. citations",
+                    threshold="0 split citations (U.S., Ala., v., Ms., So.2d)",
                 )
 
                 row = conn.execute(VALIDATION_SQL["gate_5_size_distribution"]).fetchone()
