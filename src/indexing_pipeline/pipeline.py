@@ -123,6 +123,12 @@ class IndexingPipeline:
 
     def _get_database(self) -> db.Database:
         self._require_open()
+        if not self.config.db_dsn:
+            raise PipelineError(
+                "database",
+                "DATABASE_URL is required for this stage (load, validate, index, "
+                "drop-index). The embed stage runs without a database.",
+            )
         if self._database is None:
             self._database = db.Database(
                 dsn=self.config.db_dsn,
