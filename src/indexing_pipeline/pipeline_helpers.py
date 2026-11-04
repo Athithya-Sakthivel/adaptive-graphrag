@@ -61,8 +61,8 @@ def resolve_corpus_rows(value: str) -> int:
 
 WORKERS = 1
 BATCH_SIZE = 500
-EMBED_BATCH = 4
-EMBED_CASES_PER_BATCH = 32
+EMBED_BATCH = 64  # per-GPU sub-batch inside TorchEmbedder.encode()
+EMBED_CASES_PER_BATCH = 64  # 64 cases × ~12 children ≈ 768 texts per batch call
 INFERENCE_THREADS = 4
 POOL_MIN = 1
 POOL_MAX = 4

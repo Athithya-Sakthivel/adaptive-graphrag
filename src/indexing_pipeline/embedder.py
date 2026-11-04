@@ -1,13 +1,13 @@
 """OpenVINO (CPU) and PyTorch (CUDA) embedders for dinghy-law-0.6b-v1.
 
-CPU path: static-reshaped OpenVINO IR with CACHE_DIR. The static shape is
-(STATIC_BATCH=4, STATIC_SEQUENCE=464), which matches the chunker's 400-token
-child cap plus breadcrumb margin. Compile happens once per process; the
-compiled blob is reused across restarts.
+CPU path: static-reshaped OpenVINO IR with CACHE_DIR. Compile happens once
+per process and is reused across batches and restarts.
 
-CUDA path: sentence-transformers on the base HF checkpoint. Produces vectors
-numerically equivalent to the CPU path (cosine > 0.99999), so the pipeline's
-manifest and skip logic are unchanged.
+CUDA path: sentence-transformers on the base HF checkpoint. Uses FP16,
+batches at 64, and — when more than one GPU is available — spawns a
+multi-process pool so both T4s share the workload. Produces vectors
+numerically equivalent to the CPU path (cosine > 0.99999), so the
+pipeline's manifest and skip logic is unchanged.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -28,18 +27,19 @@ from .io_utils import sha256_file
 logger = logging.getLogger(__name__)
 
 
-# ── Public constants (imported by pipeline.py) ──────────────────────────
+# ── Public constants (imported by pipeline_helpers) ─────────────────────
 
 EMBEDDING_DIMENSIONS = 1024
-MAX_SEQ_LENGTH = 512  # model's hard limit; used only for the guard
-EMBED_BATCH_SIZE = 4  # static compile batch — 4 is optimal on 4 CPU cores
+MAX_SEQ_LENGTH = 512
+EMBED_BATCH_SIZE = 8  # OpenVINO static compile batch
 BASE_MODEL_ID = "dinghy-law-0.6b-v1-openvino-fp16"
 
-# Static shape used for the CPU IR compile. Every inference pads to exactly
-# this shape, so the graph compiles once and is reused on every call.
-# 464 = 400 (chunker child cap) + ~60 (breadcrumb) + 4 (padding safety).
-STATIC_BATCH = 4
+STATIC_BATCH = 8
 STATIC_SEQUENCE = 464
+
+# TorchEmbedder tuning for T4
+TORCH_BATCH_SIZE = 64  # per-GPU sub-batch inside encode()
+MULTI_GPU_MIN_TEXTS = 400  # below this, single GPU is faster
 
 QUERY_PREFIX = (
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
@@ -47,15 +47,11 @@ QUERY_PREFIX = (
 
 
 def build_embedder_version(max_seq_length: int) -> str:
-    """Version that changes when truncation behaviour changes.
-
-    Device is intentionally NOT part of the version — CPU and CUDA produce
-    equivalent vectors, so switching backends does not invalidate the corpus.
-    """
+    """Version that changes when truncation behaviour changes."""
     return f"{BASE_MODEL_ID}-{max_seq_length}"
 
 
-# ── OpenVINO CPU embedder ───────────────────────────────────────────────
+# ── OpenVINO CPU embedder (unchanged) ──────────────────────────────────
 
 
 class Embedder:
@@ -91,6 +87,8 @@ class Embedder:
         self.compiled_model: Any = None
         self.tokenizer: Any = None
         self.input_ports: dict[str, dict[str, Any]] = {}
+        self.fixed_sequence_length: int | None = None
+        self.fixed_batch_size: int | None = None
 
         self._verify_hashes()
         self._load_tokenizer()
@@ -100,8 +98,6 @@ class Embedder:
         warmup = self.embed_documents(["A court must interpret the applicable law."])
         if warmup.shape != (1, EMBEDDING_DIMENSIONS):
             raise RuntimeError(f"unexpected warmup shape: {warmup.shape}")
-
-    # ── setup ────────────────────────────────────────────────────────
 
     def _load_tokenizer(self) -> None:
         from transformers import AutoTokenizer
@@ -149,19 +145,12 @@ class Embedder:
     def _compile_model(self) -> None:
         self.core = ov.Core()
 
-        # Persist compiled blob across process starts. Second+ process start
-        # loads the blob in ~1-2 s instead of recompiling (~20 s).
-        # Note: the OpenVINO docs warn that on CPU this may not always help;
-        # it depends on the model. It does not hurt.
         cache_dir = self.model_dir / "ov_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.core.set_property({"CACHE_DIR": str(cache_dir)})
 
         model = self.core.read_model(str(self.xml_path))
 
-        # Static reshape to (STATIC_BATCH, STATIC_SEQUENCE). This is the
-        # documented fix for per-shape recompilation. The port-keyed dict is
-        # required for multi-input models; a bare list only works for one input.
         static_shape = ov.PartialShape([STATIC_BATCH, STATIC_SEQUENCE])
         port_to_shape = {port: static_shape for port in model.inputs}
         model.reshape(port_to_shape)
@@ -171,6 +160,9 @@ class Embedder:
             ov.properties.inference_num_threads: self.threads,
         }
         self.compiled_model = self.core.compile_model(model, self.device, properties)
+
+        self.fixed_batch_size = STATIC_BATCH
+        self.fixed_sequence_length = self.max_seq_length
 
         logger.info(
             "compiled with static shape (batch=%d, seq=%d), cache_dir=%s",
@@ -214,11 +206,7 @@ class Embedder:
             ],
         )
 
-    # ── tokenize + inputs ────────────────────────────────────────────
-
     def _tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
-        # Always pad to STATIC_SEQUENCE. The graph is compiled for that
-        # exact shape; any other shape would be rejected.
         encoded = self.tokenizer(
             list(texts),
             padding="max_length",
@@ -268,8 +256,6 @@ class Embedder:
             raise RuntimeError("non-finite values in embeddings")
         return normalized.astype(np.float32)
 
-    # ── inference ────────────────────────────────────────────────────
-
     def _infer_batch(self, texts: Sequence[str]) -> np.ndarray:
         if self._closed:
             raise RuntimeError("Embedder is closed")
@@ -290,17 +276,12 @@ class Embedder:
         with self._lock:
             outputs: Any = self.compiled_model(inputs)
 
-        # OVDict is dict-like but is not a builtin dict; iterating it yields
-        # ConstOutput ports, not arrays. `.values()` yields the arrays.
-        # try/except AttributeError avoids basedpyright's callable() narrowing,
-        # which turns `Any` into `Callable[..., object]` and makes the return
-        # value `object` (non-iterable). Both branches keep `values` as `Any`.
         try:
-            values: Any = outputs.values()
+            raw: list[Any] = list(outputs.values())
         except AttributeError:
-            values = outputs
+            raw = list(outputs)
 
-        arrays = [np.asarray(v) for v in values]
+        arrays = [np.asarray(v) for v in raw]
 
         token_level = [
             a
@@ -346,7 +327,6 @@ class Embedder:
 
         batch_size = STATIC_BATCH
         total_batches = (len(order) + batch_size - 1) // batch_size
-        started = time.monotonic()
 
         for offset in range(0, len(order), batch_size):
             indices = order[offset : offset + batch_size]
@@ -356,19 +336,13 @@ class Embedder:
             output[np.asarray(indices)] = vectors
 
             batch_no = offset // batch_size + 1
-            # Log every 2 batches so the caller sees progress even for small
-            # inputs. This is the single most useful line for diagnosing
-            # "is it stuck or just slow".
             if batch_no % 2 == 0 or batch_no == total_batches:
-                elapsed = time.monotonic() - started
-                rate = (offset + len(indices)) / elapsed if elapsed > 0 else 0.0
                 logger.info(
-                    "embed_documents: %d/%d texts (batch %d/%d) %.1f texts/s",
+                    "embed_documents: %d/%d texts (batch %d/%d)",
                     min(offset + batch_size, len(order)),
                     len(order),
                     batch_no,
                     total_batches,
-                    rate,
                 )
 
         return output
@@ -394,54 +368,183 @@ class Embedder:
         self.close()
 
 
-# ── PyTorch / CUDA embedder ─────────────────────────────────────────────
+# ── PyTorch / CUDA embedder ────────────────────────────────────────────
 
 
 class TorchEmbedder:
-    """GPU/CPU embedder using sentence-transformers on the base HF checkpoint.
+    """GPU embedder with FP16 and optional multi-GPU pool.
 
-    Requires Hanno-Labs/dinghy-law-0.6b-v1 (safetensors), NOT the OpenVINO
-    IR. Produces vectors with cosine > 0.99999 vs the OpenVINO CPU path,
-    so the pipeline's manifest and skip logic is unchanged.
+    `device` may be:
+      - "cuda"        → auto-detect: uses ["cuda:0", "cuda:1"] if 2+ GPUs
+      - "cuda:0"      → single GPU
+      - ["cuda:0", "cuda:1"] → explicit list
+
+    Large batches (> MULTI_GPU_MIN_TEXTS) use a sentence-transformers
+    multi-process pool so both GPUs share the workload. Small batches
+    stay single-device to avoid the pool's fork overhead.
     """
 
     def __init__(
         self,
         model_dir: Path,
         max_seq_length: int = MAX_SEQ_LENGTH,
-        device: str = "cuda",
-        batch_size: int = 128,
+        device: str | list[str] = "cuda",
+        batch_size: int = TORCH_BATCH_SIZE,
     ) -> None:
         import torch
         from sentence_transformers import SentenceTransformer
 
-        if device.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError(
-                f"device={device} requested but torch.cuda.is_available() is False. "
-                "Install CUDA torch: pip install torch --index-url "
-                "https://download.pytorch.org/whl/cu121"
-            )
+        # ── Resolve device list ─────────────────────────────────────
+        if isinstance(device, list):
+            if not device:
+                raise ValueError("device list is empty")
+            primary = device[0]
+            self.device_list = list(device)
+            self.multi_device = len(self.device_list) > 1
+        elif isinstance(device, str):
+            if device == "cuda":
+                count = torch.cuda.device_count()
+                if count == 0:
+                    raise RuntimeError("device='cuda' requested but no CUDA devices found")
+                if count >= 2:
+                    self.device_list = ["cuda:0", "cuda:1"]
+                    self.multi_device = True
+                else:
+                    self.device_list = ["cuda:0"]
+                    self.multi_device = False
+                primary = self.device_list[0]
+            elif device.startswith("cuda"):
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        f"device={device} requested but torch.cuda.is_available() is False. "
+                        "Install CUDA torch: pip install torch --index-url "
+                        "https://download.pytorch.org/whl/cu121"
+                    )
+                primary = device
+                self.device_list = [device]
+                self.multi_device = False
+            else:
+                # cpu or other
+                primary = device
+                self.device_list = [device]
+                self.multi_device = False
+        else:
+            raise TypeError(f"device must be str or list[str], got {type(device).__name__}")
 
         self.model_dir = Path(model_dir)
         self.max_seq_length = int(max_seq_length)
-        self.device = device
+        self.device = primary
         self.batch_size = int(batch_size)
+        self._pool: Any = None
+        self._pool_failed = False
+        self._closed = False
 
+        if not self.max_seq_length or self.max_seq_length > 8192:
+            raise ValueError(f"invalid max_seq_length: {self.max_seq_length}")
+        if self.batch_size < 1:
+            raise ValueError(f"invalid batch_size: {self.batch_size}")
+
+        # ── Load primary model on the first device ──────────────────
+        logger.info(
+            "TorchEmbedder: loading model on %s (multi_device=%s, devices=%s)",
+            primary,
+            self.multi_device,
+            self.device_list,
+        )
         self.model = SentenceTransformer(
             str(self.model_dir),
-            device=self.device,
+            device=primary,
             backend="torch",
         )
         self.model.max_seq_length = self.max_seq_length
+        self.model.half()  # FP16 — ~2× T4 throughput, ~50% activation VRAM
         self.model.eval()
+
+        # ── Warmup (single-device, small, cheap) ────────────────────
+        _ = self.model.encode(
+            ["A court must interpret the applicable law."],
+            batch_size=1,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
         warmup = self.embed_documents(["A court must interpret the applicable law."])
         if warmup.shape != (1, EMBEDDING_DIMENSIONS):
             raise RuntimeError(f"unexpected warmup shape: {warmup.shape}")
 
+    # ── Pool management ─────────────────────────────────────────────
+
+    def _try_start_pool(self) -> None:
+        """Start the multi-GPU pool once. On failure, mark it permanently
+        unavailable so we never retry inside the hot path."""
+        if self._pool is not None or self._pool_failed:
+            return
+        if not self.multi_device:
+            return
+
+        try:
+            self._pool = self.model.start_multi_process_pool(target_devices=self.device_list)
+            logger.info(
+                "multi-GPU pool started on %s (batch_size=%d per device)",
+                self.device_list,
+                self.batch_size,
+            )
+        except Exception as exc:
+            logger.error("multi-GPU pool failed to start: %s", exc)
+            logger.error("falling back to single-device embedding on %s", self.device)
+            self._pool = None
+            self._pool_failed = True
+
+    # ── Inference ───────────────────────────────────────────────────
+
     def embed_documents(self, texts: list[str]) -> np.ndarray:
+        import torch
+
+        if self._closed:
+            raise RuntimeError("Embedder is closed")
         if not texts:
             return np.empty((0, EMBEDDING_DIMENSIONS), dtype=np.float32)
+        if not all(isinstance(t, str) for t in texts):
+            raise TypeError("All inputs must be strings")
+
+        # Guard: no input may exceed the model's max length. Raising here
+        # is far faster than letting the model silently truncate.
+        tokenizer = self.model.tokenizer
+        lengths = [
+            len(tokenizer.encode(t, add_special_tokens=True, truncation=False)) for t in texts
+        ]
+        oversized = [(i, n) for i, n in enumerate(lengths) if n > self.max_seq_length]
+        if oversized:
+            raise RuntimeError(
+                f"embedding input exceeds max_seq_length={self.max_seq_length}. "
+                f"First offenders: {oversized[:10]}. "
+                f"Chunking or breadcrumb budgeting must be corrected."
+            )
+
+        use_pool = self.multi_device and len(texts) >= MULTI_GPU_MIN_TEXTS and not self._pool_failed
+
+        if use_pool:
+            self._try_start_pool()
+            if self._pool is not None:
+                try:
+                    vectors = self.model.encode_multi_process(
+                        texts,
+                        self._pool,
+                        batch_size=self.batch_size,
+                        normalize_embeddings=True,
+                    )
+                    return self._finalize(vectors, len(texts))
+                except Exception as exc:
+                    logger.error(
+                        "multi-GPU encode failed (%s); falling back to single-device",
+                        type(exc).__name__,
+                    )
+                    self._pool_failed = True
+
+        # Single-device fallback (also used for small batches)
         vectors = self.model.encode(
             texts,
             batch_size=self.batch_size,
@@ -449,9 +552,19 @@ class TorchEmbedder:
             convert_to_numpy=True,
             show_progress_bar=False,
         )
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        return self._finalize(vectors, len(texts))
+
+    @staticmethod
+    def _finalize(vectors: Any, expected_count: int) -> np.ndarray:
         vectors = np.asarray(vectors, dtype=np.float32)
-        if vectors.shape != (len(texts), EMBEDDING_DIMENSIONS):
-            raise RuntimeError(f"invalid embedding shape: {vectors.shape}")
+        if vectors.shape != (expected_count, EMBEDDING_DIMENSIONS):
+            raise RuntimeError(
+                f"embedder returned invalid shape: {vectors.shape}, "
+                f"expected ({expected_count}, {EMBEDDING_DIMENSIONS})"
+            )
         if not np.isfinite(vectors).all():
             raise RuntimeError("non-finite values in embeddings")
         return vectors
@@ -462,11 +575,24 @@ class TorchEmbedder:
         return self.embed_documents([QUERY_PREFIX + text])[0]
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        if self._pool is not None:
+            try:
+                self.model.stop_multi_process_pool(self._pool)
+                logger.info("multi-GPU pool stopped")
+            except Exception:
+                logger.exception("could not stop multi-GPU pool cleanly")
+            finally:
+                self._pool = None
+
         try:
             import torch
 
             del self.model
-            if self.device.startswith("cuda"):
+            if any(isinstance(d, str) and d.startswith("cuda") for d in self.device_list):
                 torch.cuda.empty_cache()
         except Exception:
             pass
