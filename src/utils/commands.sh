@@ -1,4 +1,5 @@
 
+
 cd /workspace/src/utils
 python3 -m venv .venv
 source .venv/bin/activate
@@ -15,17 +16,9 @@ python3 src/utils/inspect_data.py /workspace/tmp/data/raw \
 python3 src/utils/inspect_data.py /workspace/tmp/data/raw \
   --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16 \
   --inspect-one 1088107
-
-
-
 cd /workspace/src
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip wheel -q
 
-pip install -r indexing_pipeline/requirements.txt -q
 
-cd /workspace/src
 
 
 # 1. Persistent volume (survives container restarts)
@@ -60,23 +53,30 @@ rm -f /workspace/tmp/data/embedded/_failures.jsonl
 rm -f /workspace/tmp/data/embedded/_manifest.jsonl
 rm -f /workspace/tmp/data/embedded/*.jsonl
 
-
 sudo apt update
 sudo apt install -y python3.14-dev build-essential
 
-git add . && git commit -m "new"
-pytest src/tests
 
-find . -type d -name "__pycache__" -exec rm -rf {} +
 
-export CORPUS_ROWS=5 && export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
+
 cd /workspace/src
 source .venv/bin/activate
-pip install -r indexing_pipeline/requirements.txt -q
-python3 -m indexing_pipeline.cli all --log-level INFO
+python -m pip install -q -r indexing_pipeline/requirements.txt pytest
+python -m pytest tests/ -v
+
+cd /workspace
+find . -type d -name "__pycache__" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+git add .
+git commit -m "chunker v2.0: strip page markers, accept ':' terminal, sync gate_3+inspect_chunks, add terminal-sync test"
+
+cd /workspace/src
+source .venv/bin/activate
+export CORPUS_ROWS=5
+export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
+python -m indexing_pipeline.cli all --log-level INFO
 
 
-# In a separate terminal, keep the .venv active
+
 cd /workspace
 source /workspace/src/utils/.venv/bin/activate
 python3 src/utils/inspect_chunks.py \
