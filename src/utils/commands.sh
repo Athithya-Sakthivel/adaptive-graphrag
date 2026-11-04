@@ -1,4 +1,22 @@
 
+cd /workspace/src/utils
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.inspect.txt -q
+cd /workspace
+
+# Full inspection
+python3 src/utils/inspect_data.py /workspace/tmp/data/raw \
+  --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16 \
+  --sample 500 --chunker-sample 30
+
+# Single case deep-dive
+python3 src/utils/inspect_data.py /workspace/tmp/data/raw \
+  --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16 \
+  --inspect-one 1088107
+
+
 
 cd /workspace/src
 python3 -m venv .venv
