@@ -7,13 +7,26 @@ When a `tokenize` callable is provided, it is used for every size check so
 the chunk boundaries match the embedder's real tokenizer exactly. When
 omitted, a 2.25 chars/token heuristic is used.
 
-v1.8 changes:
-  - Force-cuts snap backward to the nearest sentence boundary within
-    55% of the intended span (`_trim_to_sentence_end`).
-  - Overlap snap uses `backward_only=True`, preventing a forward snap
-    from creating a gap between chunks.
+v2.2 changes:
+  - Tier 1: ATOMIC_SPAN_PATTERNS extended to cover multi-word defendant
+    names ("Geohagan v. General Motors Corp.,") and the case-name-then-
+    reporter cut ("...Corp., | 555 So. 2d") that the previous pattern
+    could not protect. Fixes the 1088271 failure class.
+  - Tier 2: corruption_score() + CORRUPTION_THRESHOLD. Provides the
+    detection primitive the pipeline uses to identify opinions whose
+    source text has reverse-page-break OCR corruption (e.g. "re\n\nsults/").
+    Detection only — the pipeline decides whether to drop based on the
+    score. Chunker stays pure.
 
-v1.6 changes:
+v2.1 changes:
+  - _normalize strips CourtListener page markers (*NNN, * Hi * Hi *) at
+    ingest, before paragraph or sentence splitting. Fixes the class of
+    chunk whose tail was "...plaintiff.\n\n*84".
+  - _SENTENCE_END_RE accepts ":" as a terminal. Chunks ending in a
+    block-quote introducer ("...from Dr. Ussery's testimony :") are
+    complete sentences, not fragments.
+
+v2.0 changes:
   - Single newlines are no longer treated as paragraph boundaries.
     Wrapped lines remain together; sentence splitting handles them.
   - `max_embedding_tokens` is configurable per backend. Defaults to 464
@@ -39,14 +52,14 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
 
 # ── Versioning ──────────────────────────────────────────────────────────
 
-CHUNKER_VERSION = "chunk-v2.0"
+CHUNKER_VERSION = "chunk-v2.2"
 
 
 # ── Default embedder token limit ────────────────────────────────────────
@@ -151,9 +164,30 @@ ATOMIC_SPAN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?"),  # $10,000
     re.compile(r"\b(?:19|20)\d{2}\b"),  # 1973
     re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),  # 06/15/2020
+    # Basic case name: single plaintiff word, single defendant word.
+    # Fast path for "Roe v. Wade" style citations.
+    re.compile(r"\b[A-Z][A-Za-z']+\s+v\.\s+[A-Z][A-Za-z']+"),
+    # Case name with corporate suffix in plaintiff ("Safeguard Business
+    # Sys., Inc. v. Smith"): allows punctuation inside plaintiff words.
+    re.compile(r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+[A-Z]"),
+    # Extended case name — up to 3 more words after the defendant's first
+    # word. Fixes "Geohagan v. General Motors Corp." (v2.2). Catches cuts
+    # INSIDE a multi-word defendant name even when no reporter follows.
     re.compile(
-        r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+[A-Z]"
-    ),  # Safeguard Business Sys., Inc. v. Smith
+        r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+"
+        r"[A-Z][\w.,'\-]*\.?"
+        r"(?:(?<=\w)[ \t]+[A-Z][\w.,'\-]*\.?){0,3}"
+    ),
+    # Case name + reporter — bridges the cut between "...Corp.," and
+    # "555 So. 2d". The signature is "case name, reporter volume", i.e.
+    # comma, whitespace, digits, whitespace, capital. Fixes the case
+    # 1088271 failure where the cut landed at "Corp., | 555 So. 2d".
+    re.compile(
+        r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+"
+        r"[A-Z][\w.,'\-]*\.?"
+        r"(?:(?<=\w)[ \t]+[A-Z][\w.,'\-]*\.?){0,3}"
+        r",\s+\d+\s+[A-Z]"
+    ),
     re.compile(r"\b(?:[A-Z][a-z]*\.)+\s*Code\b"),  # Ala. Code
     re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Hon|Prof|Rev|Gen|Col|Sgt|Capt|Lt|St)\.\s+[A-Z]"),
     re.compile(r"\b(?:Jr|Sr|Inc|Ltd|Co|Corp|LLC|L\.L\.C)\.(?:\s|$|,)"),
@@ -373,7 +407,7 @@ def _make_breadcrumb(
 ) -> str:
     title_short = re.sub(r"\s+", " ", title).strip()
     if len(title_short) > 120:
-        title_short = title_short[:57].rstrip() + "..."
+        title_short = title_short[:117].rstrip() + "..."
 
     year_match = re.search(r"\b(?:19|20)\d{2}\b", date)
     year = year_match.group(0) if year_match else "date unknown"
@@ -497,10 +531,7 @@ def _sentence_spans(
     cursor = start
     body = text[start:end]
 
-    pattern = (
-        r"(?<=[.!?])[\x22\x27\u201d\u2019)]*"
-        r'\s+(?=[A-Z0-9("])'
-    )
+    pattern = r"(?<=[.!?])[\x22\x27\u201d\u2019)]*\s+(?=[A-Z0-9(\"])"
 
     for match in re.finditer(pattern, body):
         boundary = start + match.start()
@@ -519,7 +550,7 @@ def _sentence_spans(
     return result or [(start, end)]
 
 
-# Matches the end of a complete sentence: one of . ! ? … optionally
+# Matches the end of a complete sentence: one of . ! ? … : optionally
 # followed by closing quotes/brackets. Used by _trim_to_sentence_end to
 # decide whether a chunk already ends cleanly.
 _SENTENCE_END_RE = re.compile(r'[.!?…:](?:["”’)\]]+)?$')
@@ -1164,3 +1195,83 @@ def chunk_opinion(
             )
 
     return emitted
+
+
+# ── Corruption detection (Tier 2) ──────────────────────────────────────
+#
+# Reverse-page-break OCR corruption leaves chunks ending in short lowercase
+# fragments ("...deals with re"), lowercase+slash ("...sults/"), or asterisk
+# debris ("...* Hi * Hi Hi *"). These patterns cannot be repaired by any
+# boundary logic — the corruption *is* the boundary. The honest choice is
+# to detect severely corrupted opinions and let the pipeline drop them,
+# with the drop logged to a visible artifact file.
+#
+# This function returns a score, not a boolean. The pipeline decides
+# whether to drop based on CORRUPTION_THRESHOLD. Threshold 0.5 means
+# >50% of children must show corruption for the opinion to be dropped —
+# a conservative gate that never fires on isolated fragments in otherwise
+# clean opinions.
+
+CORRUPTION_THRESHOLD = 0.5
+
+_FRAGMENT_TAIL_RE = re.compile(
+    r"(?:"
+    r"\b[a-z]{1,3}$"  # ends in 1-3 lowercase letters: "...with re"
+    r"|[a-z]/$"  # ends in lowercase + slash:   "...sults/"
+    r"|\*[ \t*]*$"  # ends in asterisk debris:     "...* Hi * Hi *"
+    r")"
+)
+
+
+def corruption_score(children: Sequence[Chunk | dict[str, Any]]) -> float:
+    """Fraction of children that show evidence of source OCR corruption.
+
+    Accepts either Chunk objects (as returned by chunk_opinion) or dicts
+    (as written to chunked/*.jsonl by the pipeline). Only non-parent
+    chunks are scored — parents are not indexed.
+
+    Returns 0.0 when there are no children.
+
+    Detects three classes of reverse-page-break / OCR debris:
+      - ends in a 1-3 letter lowercase fragment ("...deals with re")
+      - ends in a lowercase letter followed by slash ("...sults/")
+      - ends in asterisk debris ("...* Hi * Hi *")
+
+    A score above CORRUPTION_THRESHOLD means >50% of children are affected
+    — the opinion cannot be meaningfully indexed without source-level
+    repair. A score below means the corruption is isolated and the
+    well-formed majority of chunks are still usable.
+    """
+    if not children:
+        return 0.0
+
+    bad = 0
+    n_children = 0
+
+    for chunk in children:
+        if isinstance(chunk, dict):
+            is_parent = bool(chunk.get("is_parent", False))
+            tail = str(chunk.get("text_original", "")).rstrip()
+        else:
+            is_parent = chunk.is_parent
+            tail = chunk.text_original.rstrip()
+
+        if is_parent:
+            continue
+
+        n_children += 1
+        if _FRAGMENT_TAIL_RE.search(tail):
+            bad += 1
+
+    return bad / n_children if n_children else 0.0
+
+
+__all__ = [
+    "CHUNKER_VERSION",
+    "CORRUPTION_THRESHOLD",
+    "Chunk",
+    "ChunkingError",
+    "EMBEDDER_MAX_TOKENS",
+    "chunk_opinion",
+    "corruption_score",
+]

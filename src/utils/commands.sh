@@ -71,7 +71,7 @@ git commit -m "chunker v2.0: strip page markers, accept ':' terminal, sync gate_
 
 cd /workspace/src
 source .venv/bin/activate
-export CORPUS_ROWS=5
+export CORPUS_ROWS=1
 export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
 python -m indexing_pipeline.cli all --log-level INFO
 
