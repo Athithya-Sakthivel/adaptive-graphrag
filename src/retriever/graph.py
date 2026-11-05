@@ -138,7 +138,7 @@ def _build_1hop_directional_sql(direction: str, rank_by: str) -> str:
     rank_clause = _rank_clause(rank_by, f"e.{edge_col}")
 
     return f"""
-SELECT DISTINCT e.{edge_col} AS case_id
+SELECT e.{edge_col} AS case_id
 FROM public.case_edges AS e
 JOIN public.cases AS ca ON ca.case_id = e.{edge_col}
 WHERE e.{match_col} = ANY(%(seeds)s::bigint[])
@@ -149,6 +149,7 @@ WHERE e.{match_col} = ANY(%(seeds)s::bigint[])
   AND (%(date_from)s::date IS NULL OR ca.date >= %(date_from)s)
   AND (%(date_to)s::date IS NULL OR ca.date <= %(date_to)s)
   AND (%(filter_case_ids)s::bigint[] IS NULL OR e.{edge_col} = ANY(%(filter_case_ids)s::bigint[]))
+GROUP BY e.{edge_col}
 ORDER BY {rank_clause}
 LIMIT %(limit)s
 """
