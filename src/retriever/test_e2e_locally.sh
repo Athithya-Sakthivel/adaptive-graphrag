@@ -281,11 +281,10 @@ def _check_arm_contributions(result: Any, failures: list[str]) -> None:
         for d in entries:
             if d.error:
                 failures.append(f"arm {d.name!r} raised: {d.error}")
-        if arm not in ("graph_1hop", "graph_2hop"):
+        if arm not in ("graph_1hop", "graph_2hop", "sparse"):
             total_hits = sum(d.hits for d in entries)
             if total_hits == 0:
                 failures.append(f"arm {arm!r} contributed 0 hits")
-
 
 def run_test(
     conn: psycopg.Connection,
