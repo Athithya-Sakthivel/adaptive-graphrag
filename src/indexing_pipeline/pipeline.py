@@ -759,8 +759,21 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                 for case_id, row in self._get_failures(self.config.chunked_dir).items()
                 if case_id in plan
             }
-
-            new_manifest: dict[int, dict] = {}
+            # v2.8: load known drops so we skip re-processing them on rerun.
+            # A case that was correctly dropped in a prior run stays dropped
+            # as long as its source_text_hash and chunker_version match.
+            drops_path = self.config.chunked_dir / "_corruption_drops.jsonl"
+            known_drops: dict[int, dict] = {}
+            if drops_path.is_file() and not self.config.force:
+                for row in read_jsonl(drops_path):
+                    cid = int(row.get("case_id", -1))
+                    if cid > 0:
+                        known_drops[cid] = row
+            # v2.8: start with previous manifest so incremental persistence
+            # never loses entries for cases not yet reached. Fixes the
+            # Ctrl-C corruption where checkpoint at case 71 wrote 71 entries
+            # instead of preserving the 1482 un-processed cases.
+            new_manifest: dict[int, dict] = dict(previous)
 
             processed = 0
             skipped = 0
@@ -814,7 +827,17 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                         failures.pop(case_id, None)
                         skipped += 1
                         return True
-
+                    # v2.8: skip known-dropped cases on rerun
+                    if not self.config.force:
+                        drop_entry = known_drops.get(case_id)
+                        if (
+                            drop_entry is not None
+                            and drop_entry.get("source_text_hash") == plan_entry.source_text_hash
+                            and drop_entry.get("chunker_version") == self.config.chunker_version
+                        ):
+                            failures.pop(case_id, None)
+                            skipped += 1
+                            return True
                     if executor is None:
                         future: concurrent.futures.Future = concurrent.futures.Future()
                         try:
@@ -868,6 +891,8 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                                     _json.dumps(
                                         {
                                             "case_id": case_id,
+                                            "source_text_hash": plan[case_id].source_text_hash,
+                                            "chunker_version": self.config.chunker_version,
                                             **qstats,
                                             "ts": utc_now(),
                                         }

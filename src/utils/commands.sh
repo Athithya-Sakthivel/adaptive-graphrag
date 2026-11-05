@@ -69,12 +69,36 @@ find . -type d -name "__pycache__" -not -path "*/.venv/*" -exec rm -rf {} + 2>/d
 git add .
 git commit -m "indexing pipeline update"
 
-cd /workspace/src
-source .venv/bin/activate
-export CORPUS_ROWS=1
-export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
-python -m indexing_pipeline.cli all --log-level INFO
 
+
+# 1. Restore manifests from HF (2 files, ~5 seconds)
+hf download Athithya117/legalrag-artifacts \
+  --repo-type dataset \
+  --include "chunked/_manifest.jsonl" \
+  --include "embedded/_manifest.jsonl" \
+  --local-dir /workspace/tmp/data
+
+# 2. Verify restoration
+wc -l /workspace/tmp/data/chunked/_manifest.jsonl
+wc -l /workspace/tmp/data/embedded/_manifest.jsonl
+# Both should be 1553
+
+# 3. Clean up partial drops from interrupted run
+rm -f /workspace/tmp/data/chunked/_corruption_drops.jsonl
+rm -f /workspace/tmp/data/chunked/_failures.jsonl
+rm -f /workspace/tmp/data/embedded/_failures.jsonl
+
+# 4. Drop schema
+docker exec -i legal-pgvector psql -U legalrag legalrag \
+  -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+
+# 5. Run ONLY the DB stages
+cd /workspace/src && source .venv/bin/activate
+export CORPUS_ROWS=2000
+export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
+python -m indexing_pipeline.cli load --log-level INFO 2>&1 | tee /tmp/load.log
+python -m indexing_pipeline.cli validate --log-level INFO 2>&1 | tee /tmp/validate.log
+python -m indexing_pipeline.cli index --log-level INFO 2>&1 | tee /tmp/index.log
 
 
 cd /workspace
@@ -82,15 +106,6 @@ source /workspace/src/utils/.venv/bin/activate
 python3 src/utils/inspect_chunks.py \
   --chunked-dir /workspace/tmp/data/chunked \
   --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16
-
-
-
-docker exec -i legal-pgvector psql -U legalrag legalrag << 'ENDSQL'
-DROP SCHEMA public CASCADE;
-CREATE SCHEMA public;
-ENDSQL
-
-HF_USER_NAME=Athithya117 bash src/utils/download_artifacts.sh /workspace/tmp/data
 
 
 
