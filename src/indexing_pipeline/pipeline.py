@@ -804,6 +804,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
             previous = self._load_manifest(self.config.chunked_dir)
 
+            # Discard failure entries that no longer belong to this plan.
             failures = {
                 case_id: row
                 for case_id, row in self._get_failures(self.config.chunked_dir).items()
@@ -815,6 +816,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
             processed = 0
             skipped = 0
             failed = 0
+            dropped = 0
 
             logger.info(
                 "chunk starting: %d cases, %d workers (chunker %s, noise_filter=%s)",
@@ -921,29 +923,71 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                         }
 
                     else:
-                        output_path = self._chunked_file(case_id)
+                        from .chunker import CORRUPTION_THRESHOLD, corruption_score
 
-                        atomic_write_jsonl(output_path, chunks)
+                        cscore = corruption_score(chunks)
 
-                        new_manifest[case_id] = {
-                            "case_id": case_id,
-                            "source_text_hash": plan[case_id].source_text_hash,
-                            "chunker_version": self.config.chunker_version,
-                            "chunk_count": len(chunks),
-                            "embedding_count": sum(1 for chunk in chunks if not chunk["is_parent"]),
-                            "file_sha256": sha256_file(output_path),
-                            "completed_at": utc_now(),
-                        }
+                        if cscore > CORRUPTION_THRESHOLD:
+                            # Source-level corruption: more than half the
+                            # children end in fragments that cannot be
+                            # repaired by any boundary logic. Log to a
+                            # separate file so pipeline.load() does not
+                            # block on the "unresolved chunking failures"
+                            # precondition — drops are an expected
+                            # outcome, not a failure.
+                            drops_path = self.config.chunked_dir / "_corruption_drops.jsonl"
+                            with drops_path.open("a") as fh:
+                                fh.write(
+                                    json.dumps(
+                                        {
+                                            "case_id": case_id,
+                                            "score": round(cscore, 4),
+                                            "n_children": sum(
+                                                1 for c in chunks if not c.get("is_parent")
+                                            ),
+                                            "ts": utc_now(),
+                                        }
+                                    )
+                                    + "\n"
+                                )
 
-                        failures.pop(case_id, None)
+                            logger.warning(
+                                "chunk: dropped case %d (corruption score %.2f > %.2f)",
+                                case_id,
+                                cscore,
+                                CORRUPTION_THRESHOLD,
+                            )
+
+                            failures.pop(case_id, None)
+                            dropped += 1
+
+                        else:
+                            output_path = self._chunked_file(case_id)
+
+                            atomic_write_jsonl(output_path, chunks)
+
+                            new_manifest[case_id] = {
+                                "case_id": case_id,
+                                "source_text_hash": plan[case_id].source_text_hash,
+                                "chunker_version": self.config.chunker_version,
+                                "chunk_count": len(chunks),
+                                "embedding_count": sum(
+                                    1 for chunk in chunks if not chunk["is_parent"]
+                                ),
+                                "file_sha256": sha256_file(output_path),
+                                "completed_at": utc_now(),
+                            }
+
+                            failures.pop(case_id, None)
 
                     if processed % FAILURE_CHECK_EVERY == 0 or processed + skipped == len(plan):
                         logger.info(
-                            "chunk progress: %d/%d, skipped=%d, failed=%d",
+                            "chunk progress: %d/%d, skipped=%d, failed=%d, dropped=%d",
                             processed + skipped,
                             len(plan),
                             skipped,
                             failed,
+                            dropped,
                         )
 
                     should_check = failed > FAILURE_ABSOLUTE or (
@@ -1012,10 +1056,12 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                 logger.info("chunk cleaned %d orphan files", orphans)
 
             logger.info(
-                "chunk complete: %d processed, %d skipped, %d failed, %d orphans removed",
+                "chunk complete: %d processed, %d skipped, %d failed, "
+                "%d dropped (corruption), %d orphans removed",
                 processed,
                 skipped,
                 failed,
+                dropped,
                 orphans,
             )
 

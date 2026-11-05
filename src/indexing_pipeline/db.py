@@ -274,7 +274,7 @@ VALIDATION_SQL: dict[str, str] = {
     """,
     "gate_3_boundary_integrity": """
         SELECT COALESCE(AVG(
-            CASE WHEN rtrim(text_original) ~ '[.!?…:]["”’)\\\]]*$'
+            CASE WHEN rtrim(text_original) ~ '[.!?…:][]["”’)]*$'
               THEN 0.0 ELSE 1.0 END
         ), 0.0)
         FROM public.chunks
@@ -690,8 +690,8 @@ class Database:
     def _index_size_mb(self, index_name: str) -> float:
         with self.pool.connection() as conn:
             row = conn.execute(
-                "SELECT pg_relation_size(format('%I.%I', 'public', %s)::regclass)",
-                (index_name,),
+                "SELECT pg_relation_size(%s::regclass)",
+                (f"public.{index_name}",),
             ).fetchone()
             return round(int(row[0]) / (1024 * 1024), 3)
 
