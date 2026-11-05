@@ -67,7 +67,7 @@ python -m pytest tests/ -v
 cd /workspace
 find . -type d -name "__pycache__" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
 git add .
-git commit -m "chunker v2.0: strip page markers, accept ':' terminal, sync gate_3+inspect_chunks, add terminal-sync test"
+git commit -m "indexing pipeline update"
 
 cd /workspace/src
 source .venv/bin/activate
@@ -82,6 +82,16 @@ source /workspace/src/utils/.venv/bin/activate
 python3 src/utils/inspect_chunks.py \
   --chunked-dir /workspace/tmp/data/chunked \
   --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16
+
+
+
+docker exec -i legal-pgvector psql -U legalrag legalrag << 'ENDSQL'
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+ENDSQL
+
+HF_USER_NAME=Athithya117 bash src/utils/download_artifacts.sh /workspace/tmp/data
+
 
 
 cd /workspace

@@ -62,7 +62,7 @@ BAD_ENDING_RATE_MAX = 0.02
 BREADCRUMB_RE = re.compile(r"^\[[^\]\n]+ · [^\]\n]+ · [^\]\n]+ · [^\]\n]+\]")
 
 # Boundary integrity regex — matches db.py gate_3
-END_PUNCT_RE = re.compile(r'[.!?…:](?:["”’)\]]+)?$')
+END_PUNCT_RE = re.compile(r"""[.!?…:;][]["”’')\s]*$""")
 
 # Citation-split patterns — must match db.py gate_4 (7 specific clauses).
 # The previous catch-all `(?:[A-Z][a-z]+\.)+$` was removed: it matched
