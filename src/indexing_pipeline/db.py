@@ -1,4 +1,11 @@
-"""All SQL. The only file that imports psycopg."""
+"""All SQL. The only file that imports psycopg.
+
+Requires PostgreSQL extensions:
+  - vector  (pgvector, for halfvec(1024) HNSW)
+  - pg_trgm (for fuzzy case-name search)
+
+Both are created by ``ensure_schema()`` via ``SCHEMA_STATEMENTS``.
+"""
 
 from __future__ import annotations
 
@@ -72,7 +79,9 @@ CHUNK_COPY_COLUMNS = ", ".join(CHUNK_COLUMNS)
 # ── Schema ────────────────────────────────────────────────────────────────
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
+    # Extensions first. Both are required by later indexes.
     "CREATE EXTENSION IF NOT EXISTS vector",
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
     """
     CREATE TABLE IF NOT EXISTS public.cases (
         case_id              BIGINT PRIMARY KEY,
@@ -193,6 +202,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 
 
 # ── Indexes ───────────────────────────────────────────────────────────────
+#
+# Three dicts must stay in lockstep. The invariant check below fails at
+# import time if they drift — this prevents the KeyError-in-build_indexes
+# bug that shipped when pg_trgm entries were added to INDEXES but not the
+# companion dicts.
 
 INDEXES: dict[str, str] = {
     "cases_court_date": """
@@ -206,6 +220,14 @@ INDEXES: dict[str, str] = {
     "cases_citation": """
         CREATE INDEX CONCURRENTLY idx_cases_citation
         ON public.cases (citation)
+    """,
+    "cases_case_name_trgm": """
+        CREATE INDEX CONCURRENTLY idx_cases_case_name_trgm
+        ON public.cases USING gin (case_name gin_trgm_ops)
+    """,
+    "cases_short_trgm": """
+        CREATE INDEX CONCURRENTLY idx_cases_short_trgm
+        ON public.cases USING gin (case_name_short gin_trgm_ops)
     """,
     "embedding": """
         CREATE INDEX CONCURRENTLY idx_chunks_embedding
@@ -230,6 +252,8 @@ INDEX_NAME_BY_KEY: dict[str, str] = {
     "cases_court_date": "idx_cases_court_date",
     "cases_precedential_status": "idx_cases_precedential_status",
     "cases_citation": "idx_cases_citation",
+    "cases_case_name_trgm": "idx_cases_case_name_trgm",
+    "cases_short_trgm": "idx_cases_short_trgm",
     "embedding": "idx_chunks_embedding",
     "tsv": "idx_chunks_tsv",
     "case_edges_source": "idx_edges_source",
@@ -240,6 +264,8 @@ INDEX_EXPECTATION: dict[str, str] = {
     "cases_court_date": "(court, date)",
     "cases_precedential_status": "(precedential_status)",
     "cases_citation": "(citation)",
+    "cases_case_name_trgm": "gin (case_name gin_trgm_ops)",
+    "cases_short_trgm": "gin (case_name_short gin_trgm_ops)",
     "embedding": "halfvec_cosine_ops",
     "tsv": "using gin (tsv)",
     "case_edges_source": "(source_id, relation)",
@@ -247,6 +273,37 @@ INDEX_EXPECTATION: dict[str, str] = {
 }
 
 ALL_INDEX_NAMES: tuple[str, ...] = tuple(INDEX_NAME_BY_KEY.values())
+
+
+# ── Invariant: three dicts in lockstep ────────────────────────────────────
+# If this raises, fix the dicts above before touching anything else.
+
+
+def _check_index_dicts() -> None:
+    keys = set(INDEXES)
+    names = set(INDEX_NAME_BY_KEY)
+    expectations = set(INDEX_EXPECTATION)
+
+    if keys != names or keys != expectations:
+        missing_names = keys - names
+        missing_expect = keys - expectations
+        extra_names = names - keys
+        extra_expect = expectations - keys
+
+        parts: list[str] = ["Index dicts out of sync:"]
+        if missing_names:
+            parts.append(f"  INDEX_NAME_BY_KEY missing: {sorted(missing_names)}")
+        if missing_expect:
+            parts.append(f"  INDEX_EXPECTATION missing: {sorted(missing_expect)}")
+        if extra_names:
+            parts.append(f"  INDEX_NAME_BY_KEY extra:   {sorted(extra_names)}")
+        if extra_expect:
+            parts.append(f"  INDEX_EXPECTATION extra:   {sorted(extra_expect)}")
+
+        raise RuntimeError("\n".join(parts))
+
+
+_check_index_dicts()
 
 
 # ── Validation gates ──────────────────────────────────────────────────────
@@ -354,6 +411,7 @@ VALIDATION_SQL: dict[str, str] = {
     """,
 }
 
+
 # ── Result types ──────────────────────────────────────────────────────────
 
 
@@ -381,10 +439,10 @@ class DatabaseError(Exception):
         super().__init__(reason if not detail else f"{reason}: {detail}")
 
 
-# ── Lazy pgvector loaders ───────────────────────────────────────────────
+# ── Lazy pgvector loaders ────────────────────────────────────────────────
 # pgvector is only needed for insert (HalfVector) and connect
 # (register_vector). manifest / chunk / embed never touch it, so a broken
-# Kaggle pgvector must not break `import indexing_pipeline`.
+# pgvector install must not break `import indexing_pipeline`.
 
 _HALF_VECTOR_CLASS: Any = None
 _REGISTER_VECTOR_FN: Any = None

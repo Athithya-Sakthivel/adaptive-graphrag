@@ -59,7 +59,7 @@ def test_all_three_terminal_sets_agree() -> None:
 def test_terminal_set_contains_documented_chars() -> None:
     """Lock down the specific chars so a regression is caught even if
     all three files drift together."""
-    expected = frozenset(".!?…:")
+    expected = frozenset(".!?…:;")
     actual = _extract_char_class(chunker._SENTENCE_END_RE)
     assert actual == expected, (
         f"terminal set changed: {sorted(actual)} != {sorted(expected)}. "
