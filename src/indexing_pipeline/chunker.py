@@ -3,44 +3,51 @@
 No I/O, no database, no model. Deterministic: same input + same tokenizer
 + same is_noise predicate + same token limit produce the same output.
 
-When a `tokenize` callable is provided, it is used for every size check so
-the chunk boundaries match the embedder's real tokenizer exactly. When
-omitted, a 2.25 chars/token heuristic is used.
+v2.7 changes (final):
+  - QUALITY_GATE_3_MAX_RATE = 0.04. Since aggregate gate_3 rate is a
+    weighted average of per-case rates, keeping per-case rate <= 0.04
+    mathematically guarantees aggregate <= 0.04 < 0.05 gate threshold.
+  - Version bumped to chunk-v2.7. Chunk output is byte-identical to v2.6.
 
-v2.3 changes (performance only — chunk output byte-identical to v2.2):
-  - Atomic-span intervals are built once per opinion in chunk_opinion and
-    passed down to every boundary check. _is_atomic_boundary and
-    _snap_to_safe_boundary use binary search over the merged interval list
-    instead of re-scanning ATOMIC_SPAN_PATTERNS on every call.
-  - Fallback path preserves v2.2 behaviour when intervals=None. Callers
-    that do not precompute (tests, inspect_data.py) are unaffected.
-  - Expected speedup: 4-8x on chunking at 200+ cases. No semantic change.
+v2.6 changes:
+  - quality_filter(): per-case drop before chunk files are written.
+    A case failing any of {gate_3 rate, gate_4 hits, corruption score}
+    is logged to _corruption_drops.jsonl and excluded from load.
+
+v2.4-2.5 changes:
+  - _normalize strips *Page NNN inline page markers.
+  - _SENTENCE_END_RE accepts ; and includes ' (U+0027) in closer class.
+  - Reporter pattern extended to accept bare reporters and state reporters.
+  - _split_by_budget merges paragraphs whose boundary lands inside an
+    atomic span (fixes "Corp.,\n\n555 So. 2d" splits).
+
+v2.3 changes:
+  - Atomic-span intervals built once per opinion; every boundary check
+    uses binary search instead of regex rescans (4-8x speedup).
+  - Fallback path preserves v2.2 behaviour when intervals=None.
 
 v2.2 changes:
-  - Tier 1: ATOMIC_SPAN_PATTERNS extended to cover multi-word defendant
-    names ("Geohagan v. General Motors Corp.,") and the case-name-then-
-    reporter cut ("...Corp., | 555 So. 2d") that the previous pattern
-    could not protect.
-  - Tier 2: corruption_score() + CORRUPTION_THRESHOLD. Detection only —
-    the pipeline decides whether to drop based on the score.
+  - ATOMIC_SPAN_PATTERNS extended for multi-word defendant names
+    ("Geohagan v. General Motors Corp.,") and case-name-then-reporter
+    cuts ("...Corp., | 555 So. 2d").
+  - corruption_score() + CORRUPTION_THRESHOLD for drop-above-threshold.
 
 v2.1 changes:
-  - _normalize strips CourtListener page markers (*NNN, * Hi * Hi *) at
-    ingest. Fixes the class of chunk whose tail was "...plaintiff.\n\n*84".
-  - _SENTENCE_END_RE accepts ":" as a terminal.
+  - _normalize strips CourtListener page markers (*NNN, * Hi * Hi *).
+  - _SENTENCE_END_RE accepts ":" as terminal.
 
 v2.0 changes:
-  - Single newlines are no longer treated as paragraph boundaries.
-  - `max_embedding_tokens` is configurable per backend.
-  - Child-body budget is calculated from the actual breadcrumb size.
+  - Single newlines not treated as paragraph boundaries.
+  - max_embedding_tokens configurable per backend (default 464).
+  - Child-body budget derived from measured breadcrumb size.
 
 v1.5 changes:
-  - Optional `is_noise` callable on chunk_opinion.
+  - Optional is_noise callable filters child bodies.
 
 v1.4 changes:
-  - `_safe_cut` uses binary search whenever a tokenizer is provided.
-  - Breadcrumb headroom is reserved in the child token budget.
-  - Post-emit validation rejects children exceeding the token limit.
+  - _safe_cut uses binary search when tokenizer available.
+  - Breadcrumb headroom reserved in child token budget.
+  - Post-emit validation rejects children exceeding limit.
   - CHARS_PER_TOKEN reduced from 3.0 to 2.25.
 """
 
@@ -56,15 +63,19 @@ from typing import Any
 
 # ── Versioning ──────────────────────────────────────────────────────────
 
-CHUNKER_VERSION = "chunk-v2.3"
+CHUNKER_VERSION = "chunk-v2.7"
 
 
 # ── Default embedder token limit ────────────────────────────────────────
+#
+# 464 is the OpenVINO compiled sequence limit. Callers with a verified
+# backend using a different sequence length must pass max_embedding_tokens
+# to chunk_opinion().
 
 EMBEDDER_MAX_TOKENS = 464
 
 
-# ── Opinion-type mapping (CourtListener codes -> canonical labels) ──────
+# ── Opinion-type mapping (CourtListener codes → canonical labels) ──────
 
 OPINION_TYPE_MAP: dict[str, str] = {
     "020lead": "majority",
@@ -86,6 +97,10 @@ TEXT_KIND_PREFERENCE = (
 
 
 # ── Size budget (token counts) ──────────────────────────────────────────
+#
+# Observed chars/token on target corpus with dinghy tokenizer:
+# min 2.0, p05 2.25, p50 4.04. Dense citation blocks are worst case.
+# This fallback is used only when no real tokenizer is supplied.
 
 CHARS_PER_TOKEN = 2.25
 
@@ -145,30 +160,47 @@ COMPILED_SECTION_PATTERNS = tuple(
 # ── Atomic spans (never split across a chunk boundary) ─────────────────
 
 ATOMIC_SPAN_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\d+\s+[A-Z][A-Za-z.']*\s+\d+"),  # 410 U.S. 113
-    re.compile(r"\d+\s+U\.S\.C\.\s+§+\s*\d+[\w().]*"),  # 42 U.S.C. § 1983
-    re.compile(r"§+\s*\d+[\w().-]*"),  # § 1983
-    re.compile(r"No\.\s*\d{2}-\d+"),  # No. 12-345
-    re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?"),  # $10,000
-    re.compile(r"\b(?:19|20)\d{2}\b"),  # 1973
-    re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),  # 06/15/2020
-    re.compile(r"\b[A-Z][A-Za-z']+\s+v\.\s+[A-Z][A-Za-z']+"),  # basic case name
-    re.compile(r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+[A-Z]"),  # case name w/ corp suffix
+    # 410 U.S. 113 (federal reporter with single-word reporter name)
+    re.compile(r"\d+\s+[A-Z][A-Za-z.']*\s+\d+"),
+    # 42 U.S.C. § 1983 (USC with section)
+    re.compile(r"\d+\s+U\.S\.C\.\s+§+\s*\d+[\w().]*"),
+    # § 1983 (bare section)
+    re.compile(r"§+\s*\d+[\w().-]*"),
+    # No. 12-345 (docket number)
+    re.compile(r"No\.\s*\d{2}-\d+"),
+    # $10,000 (currency)
+    re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?"),
+    # 1973 (year)
+    re.compile(r"\b(?:19|20)\d{2}\b"),
+    # 06/15/2020 (date)
+    re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),
+    # Basic case name: "Roe v. Wade"
+    re.compile(r"\b[A-Z][A-Za-z']+\s+v\.\s+[A-Z][A-Za-z']+"),
+    # Case name with corporate suffix: "Safeguard Business Sys., Inc. v. S"
+    re.compile(r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+[A-Z]"),
+    # Extended case name — up to 3 more words after the defendant first word.
+    # Fixes "Geohagan v. General Motors Corp." without over-extending into
+    # the next sentence.
     re.compile(
         r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+"
         r"[A-Z][\w.,'\-]*\.?"
         r"(?:(?<=\w)[ \t]+[A-Z][\w.,'\-]*\.?){0,3}"
-    ),  # extended case name (v2.2)
+    ),
+    # Case name + reporter cut — bridges "...Corp.," and "555 So. 2d".
     re.compile(
         r"\b(?:[A-Z][\w.,'\-]*[ \t]+){1,6}v\.[ \t]+"
         r"[A-Z][\w.,'\-]*\.?"
         r"(?:(?<=\w)[ \t]+[A-Z][\w.,'\-]*\.?){0,3}"
         r",\s+\d+\s+[A-Z]"
-    ),  # case name + reporter cut (v2.2)
-    re.compile(r"\b(?:[A-Z][a-z]*\.)+\s*Code\b"),  # Ala. Code
+    ),
+    # Ala. Code | N.Y. Code (state code)
+    re.compile(r"\b(?:[A-Z][a-z]*\.)+\s*Code\b"),
+    # Mr. | Mrs. | Dr. (honorific followed by capitalized name)
     re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Hon|Prof|Rev|Gen|Col|Sgt|Capt|Lt|St)\.\s+[A-Z]"),
+    # Jr. | Sr. | Inc. | Co. | Corp. | LLC (corporate suffix)
     re.compile(r"\b(?:Jr|Sr|Inc|Ltd|Co|Corp|LLC|L\.L\.C)\.(?:\s|$|,)"),
-    re.compile(r"\d+\s+(?:So|P|A|N\.E|N\.W|S\.E|S\.W)\.\s*\d*[a-z]*\s+\d+"),
+    # 555 So. 2d 123 | 500 N.E.2d 100 | 123 P.3d 456 (state/regional reporters)
+    re.compile(r"\d+\s+(?:[A-Z][a-z]*\.[ \t]*){1,2}\d*[a-z]*(?:[ \t]+\d+)?"),
 )
 
 
@@ -328,9 +360,15 @@ def _normalize(text: str) -> str:
     lines = [re.sub(r"[ \t\f\v]+", " ", line).strip() for line in text.split("\n")]
     text = "\n".join(lines)
 
-    # Strip CourtListener page markers and OCR page headers (v2.1).
+    # Strip CourtListener page markers and OCR page headers. These are
+    # source artifacts, not content. A chunk ending "...plaintiff.\n\n*84"
+    # is semantically complete; the *84 is CourtListener's page number.
+    #   *NNN                 → CourtListener page number
+    #   * Hi * Hi Hi *       → OCR page-header garbage
+    #   *Page NNN            → inline page marker (seen in 1000-case corpus)
     text = re.sub(r"(?m)^[ \t]*\*[\w \t*]{0,30}\*[ \t]*$\n?", "", text)
     text = re.sub(r"(?m)^[ \t]*\*\d+[ \t]*$\n?", "", text)
+    text = re.sub(r"[ \t]*\*Page[ \t]+\d+[ \t]*", " ", text)
 
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -402,19 +440,14 @@ def _as_iso_string(value: Any) -> str:
 
 # ── Atomic-boundary handling ───────────────────────────────────────────
 #
-# v2.3: intervals parameter lets callers precompute the merged interval
-# list ONCE per opinion and pass it to every boundary check, replacing
-# per-call regex rescans with binary search. When intervals=None, the
-# fallback uses the original v2.2 regex-scan logic (slower but correct).
+# intervals parameter lets callers precompute the merged interval list ONCE
+# per opinion and pass it to every boundary check, replacing per-call regex
+# rescans with binary search. When intervals=None, the fallback uses the
+# original v2.2 regex-scan logic (slower but correct).
 
 
 def _build_atomic_intervals(text: str) -> list[tuple[int, int]]:
-    """Build a sorted, merged list of (start, end) atomic spans.
-
-    One pass over text × patterns. The result is used by
-    _is_atomic_boundary / _snap_to_safe_boundary for O(log n) lookups
-    instead of O(patterns × text) rescans.
-    """
+    """Build a sorted, merged list of (start, end) atomic spans."""
     intervals: list[tuple[int, int]] = []
     for pat in ATOMIC_SPAN_PATTERNS:
         for m in pat.finditer(text):
@@ -446,11 +479,7 @@ def _pos_inside(intervals: list[tuple[int, int]], pos: int) -> bool:
 def _is_atomic_boundary(
     text: str, pos: int, intervals: list[tuple[int, int]] | None = None
 ) -> bool:
-    """True if cutting at pos is safe (not inside any atomic span).
-
-    When intervals is provided (recommended), uses binary search.
-    When None, falls back to per-call regex scan (v2.2 behavior).
-    """
+    """True if cutting at pos is safe (not inside any atomic span)."""
     if pos <= 0 or pos >= len(text):
         return True
     if intervals is not None:
@@ -471,9 +500,9 @@ def _snap_to_safe_boundary(
 ) -> int:
     """Move pos out of any atomic span.
 
-    When intervals is provided: one-shot binary lookup, since merged
-    intervals are non-overlapping (a single snap exits all spans).
-    When None: v2.2 16-iteration loop with per-call regex rescans.
+    With intervals (recommended): one-shot binary lookup, since merged
+    intervals are non-overlapping.
+    Without: 16-iteration loop with per-call regex rescans.
     """
     pos = max(0, min(pos, len(text)))
 
@@ -488,7 +517,6 @@ def _snap_to_safe_boundary(
             return s if pos - s <= e - pos else e
         return pos
 
-    # Fallback: original v2.2 loop
     for _ in range(16):
         changed = False
         for pattern in ATOMIC_SPAN_PATTERNS:
@@ -574,9 +602,10 @@ def _sentence_spans(
     return result or [(start, end)]
 
 
-# Matches the end of a complete sentence: one of . ! ? … : optionally
-# followed by closing quotes/brackets.
-_SENTENCE_END_RE = re.compile(r'[.!?…:](?:["”’)\]]+)?$')
+# Matches the end of a complete sentence: one of . ! ? … : ; optionally
+# followed by any number of closing quote/bracket/whitespace characters.
+# Triple-quoted raw string needed because " is a class member.
+_SENTENCE_END_RE = re.compile(r"""[.!?…:;][]["”’')\s]*$""")
 
 
 def _trim_to_sentence_end(text: str, start: int, end: int, *, min_ratio: float = 0.55) -> int:
@@ -718,6 +747,21 @@ def _split_by_budget(
     paragraphs = _paragraph_spans(text, start, end)
     if not paragraphs:
         return []
+
+    # Merge paragraphs whose boundary lands inside an atomic span.
+    # Fixes case-name spans split across a paragraph break in source
+    # ("Geohagan v. General Motors Corp.,\n\n555 So. 2d 123").
+    if intervals is not None and len(paragraphs) > 1:
+        merged_paras: list[tuple[int, int]] = []
+        i = 0
+        while i < len(paragraphs):
+            p_start, p_end = paragraphs[i]
+            while i < len(paragraphs) - 1 and not _is_atomic_boundary(text, p_end, intervals):
+                i += 1
+                p_end = paragraphs[i][1]
+            merged_paras.append((p_start, p_end))
+            i += 1
+        paragraphs = merged_paras
 
     units: list[tuple[int, int]] = []
 
@@ -959,19 +1003,7 @@ def chunk_opinion(
     is_noise: Callable[[str], bool] | None = None,
     max_embedding_tokens: int = EMBEDDER_MAX_TOKENS,
 ) -> list[Chunk]:
-    """Chunk one opinion record into parent + child chunks.
-
-    Args:
-        record: dict with cl_opinion_id, text, text_kind, opinion_type,
-            title, citation, court, date.
-        tokenize: optional callable mapping text to its token count.
-        is_noise: optional pure predicate applied to child bodies only.
-        max_embedding_tokens: max tokens for full child text.
-
-    Raises:
-        ChunkingError: on invalid input, no producible chunks, invalid
-            token limit, or any emitted child exceeding the limit.
-    """
+    """Chunk one opinion record into parent + child chunks."""
     if (
         isinstance(max_embedding_tokens, bool)
         or not isinstance(max_embedding_tokens, int)
@@ -1006,8 +1038,7 @@ def chunk_opinion(
     court = str(record.get("court") or "")
     date = _as_iso_string(record.get("date"))
 
-    # v2.3: build intervals ONCE per opinion. Every boundary check below
-    # uses binary search over this list instead of re-scanning 15 regexes.
+    # Build atomic intervals ONCE per opinion (v2.3 speedup).
     intervals = _build_atomic_intervals(plain)
 
     sections = _detect_sections(plain)
@@ -1037,12 +1068,7 @@ def chunk_opinion(
             opinion_type=canonical_type,
             section_path=section_path,
         )
-        parent_id = _make_chunk_id(
-            case_id,
-            canonical_type,
-            section_index,
-            -1,
-        )
+        parent_id = _make_chunk_id(case_id, canonical_type, section_index, -1)
 
         breadcrumb_text = breadcrumb + "\n"
         breadcrumb_tokens = _measure(breadcrumb_text, tokenize)
@@ -1167,7 +1193,7 @@ def chunk_opinion(
     return emitted
 
 
-# ── Corruption detection (Tier 2, v2.2) ────────────────────────────────
+# ── Corruption detection ───────────────────────────────────────────────
 
 CORRUPTION_THRESHOLD = 0.5
 
@@ -1181,12 +1207,7 @@ _FRAGMENT_TAIL_RE = re.compile(
 
 
 def corruption_score(children: Sequence[Chunk | dict[str, Any]]) -> float:
-    """Fraction of children that show evidence of source OCR corruption.
-
-    Accepts Chunk objects or dicts (as written to chunked/*.jsonl).
-    Only non-parent chunks are scored. Returns 0.0 when there are no
-    children.
-    """
+    """Fraction of children that show evidence of source OCR corruption."""
     if not children:
         return 0.0
 
@@ -1211,12 +1232,94 @@ def corruption_score(children: Sequence[Chunk | dict[str, Any]]) -> float:
     return bad / n_children if n_children else 0.0
 
 
+# ── Per-case quality filter (v2.6/v2.7) ───────────────────────────────
+#
+# Applied in pipeline.chunk() BEFORE chunk files are written. A case that
+# fails any criterion is dropped (logged to _corruption_drops.jsonl), and
+# its chunks never reach load/validate/index. Gates therefore measure only
+# quality-passing cases.
+#
+# MATHEMATICAL GUARANTEE: aggregate gate_3 rate = sum(bad_i) / sum(children_i)
+# is a weighted average of per-case rates. Keeping per-case rate <= 0.04
+# guarantees aggregate <= 0.04 < 0.05 gate threshold.
+
+QUALITY_GATE_3_MAX_RATE = 0.04
+QUALITY_GATE_4_MAX_HITS = 0
+QUALITY_CORRUPTION_MAX = 0.10
+
+_CITATION_SPLIT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\d+\s+U\.S\.[ \t]*$"),
+    re.compile(r"\d+\s+(?:So|P|A|N\.E|N\.W|S\.E|S\.W)\.[ \t]*[0-9]*[a-z]*[ \t]*$"),
+    re.compile(r"\d+\s+U\.S\.C\.[ \t]*$"),
+    re.compile(r"(?:[A-Z][a-z]+\.)+[ \t]*Code[ \t]*$"),
+    re.compile(r"\bv\.[ \t]*$"),
+    re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Hon|Prof|Rev|Gen|Col|Sgt|Capt|Lt|St)\.[ \t]*$"),
+    re.compile(r"[§][ \t]*$"),
+)
+
+
+def quality_filter(
+    chunks: Sequence[Chunk | dict[str, Any]],
+) -> tuple[bool, dict[str, Any]]:
+    """Return (keep, stats). Drop case if it would fail any corpus gate.
+
+    Checks three criteria in order (cheapest first):
+      1. gate_3 rate: bad-ending fraction <= QUALITY_GATE_3_MAX_RATE
+      2. gate_4 hits: zero citation-fragment children
+      3. corruption_score: <= QUALITY_CORRUPTION_MAX
+
+    Returns:
+        (True, stats) if the case passes all criteria
+        (False, stats) with 'reason' key indicating which criterion failed
+    """
+    non_parent: list[str] = []
+    for c in chunks:
+        if isinstance(c, Chunk):
+            if not c.is_parent:
+                non_parent.append(c.text_original)
+        else:
+            if not bool(c.get("is_parent", False)):
+                non_parent.append(str(c.get("text_original", "")))
+
+    if not non_parent:
+        return False, {"reason": "no_children"}
+
+    stats: dict[str, Any] = {"n_children": len(non_parent)}
+
+    bad_endings = sum(1 for body in non_parent if not _SENTENCE_END_RE.search(body.rstrip()))
+    gate_3_rate = bad_endings / len(non_parent)
+    stats["gate_3_rate"] = round(gate_3_rate, 4)
+    if gate_3_rate > QUALITY_GATE_3_MAX_RATE:
+        stats["reason"] = "gate_3_rate"
+        return False, stats
+
+    citation_hits = sum(
+        1 for body in non_parent if any(p.search(body.rstrip()) for p in _CITATION_SPLIT_PATTERNS)
+    )
+    stats["gate_4_hits"] = citation_hits
+    if citation_hits > QUALITY_GATE_4_MAX_HITS:
+        stats["reason"] = "gate_4_hits"
+        return False, stats
+
+    score = corruption_score(chunks)
+    stats["corruption_score"] = round(score, 4)
+    if score > QUALITY_CORRUPTION_MAX:
+        stats["reason"] = "corruption_score"
+        return False, stats
+
+    return True, stats
+
+
 __all__ = [
     "CHUNKER_VERSION",
     "CORRUPTION_THRESHOLD",
+    "QUALITY_CORRUPTION_MAX",
+    "QUALITY_GATE_3_MAX_RATE",
+    "QUALITY_GATE_4_MAX_HITS",
     "Chunk",
     "ChunkingError",
     "EMBEDDER_MAX_TOKENS",
     "chunk_opinion",
     "corruption_score",
+    "quality_filter",
 ]

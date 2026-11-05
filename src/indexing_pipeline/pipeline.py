@@ -11,8 +11,8 @@ skip logic, halt handling, and fingerprinting.
 
 LoadMixin provides embed, load, validate, index, drop_indexes and their
 supporting methods. At type-check time LoadMixin inherits from
-IndexingPipelineBase (see pipeline_load.py); at runtime it inherits from
-object so the MRO composition in this file is consistent.
+IndexingPipelineBase; at runtime it inherits from object so the MRO
+composition in this file is consistent.
 
 run_all() is the composition entry point.
 
@@ -162,7 +162,6 @@ class IndexingPipelineBase:
                     "loading OpenVINO Embedder device=CPU model_dir=%s",
                     self.config.model_dir,
                 )
-
                 self._embedder = Embedder(
                     model_dir=self.config.model_dir,
                     max_seq_length=self.config.max_seq_length,
@@ -196,15 +195,9 @@ class IndexingPipelineBase:
     def _get_tokenizer(self) -> Callable[[str], int]:
         """Load the tokenizer belonging to the active embedding backend.
 
-        Prefers the tokenizer matching the active backend (gpu_model_dir
-        when device is CUDA, model_dir otherwise), but falls back to the
-        other directory when the preferred one is not present. On Kaggle,
-        chunking runs with device=cpu but only the GPU checkpoint is
-        downloaded — the OpenVINO IR is not. A strict primary-only lookup
-        fails in that environment.
-
-        A warning is emitted when the fallback directory is used, so the
-        operator can see which tokenizer actually drove chunk sizing.
+        Prefers the tokenizer matching the active backend, but falls back
+        to the other directory when the preferred one is absent (Kaggle
+        has gpu_model_dir but not model_dir).
         """
         if self._tokenizer_fn is None:
             from transformers import AutoTokenizer
@@ -341,11 +334,7 @@ class IndexingPipelineBase:
             yield from batch.to_pylist()
 
     def _read_all_case_ids(self) -> list[int]:
-        """Read and validate every opinion ID in the source corpus.
-
-        NULL and duplicate IDs are rejected instead of being silently
-        collapsed during manifest construction.
-        """
+        """Read and validate every opinion ID in the source corpus."""
         parquet = pq.ParquetFile(self.config.corpus_file)
 
         if "cl_opinion_id" not in parquet.schema_arrow.names:
@@ -523,19 +512,13 @@ class IndexingPipelineBase:
         )
 
     @staticmethod
-    def _check_failure_threshold(
-        failed: int,
-        processed: int,
-    ) -> bool:
+    def _check_failure_threshold(failed: int, processed: int) -> bool:
         if failed <= 0:
             return False
-
         if failed > FAILURE_ABSOLUTE:
             return True
-
         if processed <= 0:
             return False
-
         return failed / processed > FAILURE_RATE
 
     def _persist_chunk_state(
@@ -576,10 +559,8 @@ class IndexingPipelineBase:
         for path in directory.iterdir():
             if path.suffix != ".jsonl" or path.name.startswith("_"):
                 continue
-
             if not path.stem.isdigit():
                 continue
-
             if int(path.stem) not in keep_ids:
                 path.unlink()
                 removed += 1
@@ -589,19 +570,13 @@ class IndexingPipelineBase:
     # ── Fingerprint ─────────────────────────────────────────────────
 
     def _dataset_fingerprint(self) -> str:
-        """Fingerprint source files, plan, versions, and embedding settings.
-
-        Invalidates pipeline state when source data, manifest plan,
-        chunker/filter/dedup versions, or embedding configuration changes.
-        """
+        """Fingerprint source files, plan, versions, and embedding settings."""
         plan_path = self.config.manifest_dir / "plan.jsonl"
 
         plan_hash = sha256_file(plan_path) if plan_path.is_file() else None
-
         plan_rows = sum(1 for _ in read_jsonl(plan_path)) if plan_path.is_file() else 0
 
         embedding_backend = "torch" if self.config.device.startswith("cuda") else "openvino"
-
         active_model_dir = (
             self.config.gpu_model_dir if embedding_backend == "torch" else self.config.model_dir
         )
@@ -685,13 +660,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                     "manifest skipped: unchanged (effective=%d)",
                     effective,
                 )
-                return StageReport(
-                    "manifest",
-                    0,
-                    effective,
-                    0,
-                    time.monotonic() - started,
-                )
+                return StageReport("manifest", 0, effective, 0, time.monotonic() - started)
 
             if self.config.dry_run:
                 logger.info(
@@ -700,24 +669,16 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                     requested,
                     len(all_ids),
                 )
-                return StageReport(
-                    "manifest",
-                    0,
-                    effective,
-                    0,
-                    time.monotonic() - started,
-                )
+                return StageReport("manifest", 0, effective, 0, time.monotonic() - started)
 
             self.config.manifest_dir.mkdir(parents=True, exist_ok=True)
 
             keep_ids = set(sorted(all_ids)[:effective])
 
             plan_rows: list[dict[str, Any]] = []
-
             for record in self._iter_opinions(keep_ids):
                 case_id = int(record["cl_opinion_id"])
                 cluster_id = record.get("cluster_id")
-
                 plan_rows.append(
                     {
                         "case_id": case_id,
@@ -761,13 +722,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                 len(all_ids),
             )
 
-            return StageReport(
-                "manifest",
-                len(plan_rows),
-                0,
-                0,
-                time.monotonic() - started,
-            )
+            return StageReport("manifest", len(plan_rows), 0, 0, time.monotonic() - started)
 
     # ── Stage: chunk — tokenizer-aware, resumable, deterministic ────
 
@@ -792,13 +747,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
             if self.config.dry_run:
                 logger.info("chunk dry-run: %d cases", len(plan))
-                return StageReport(
-                    "chunk",
-                    0,
-                    len(plan),
-                    0,
-                    time.monotonic() - started,
-                )
+                return StageReport("chunk", 0, len(plan), 0, time.monotonic() - started)
 
             self.config.chunked_dir.mkdir(parents=True, exist_ok=True)
 
@@ -827,7 +776,6 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
             )
 
             tokenize = self._get_tokenizer() if self.config.workers == 1 else None
-
             noise = is_noise_chunk if self.config.noise_filter_enabled else None
 
             executor: concurrent.futures.ProcessPoolExecutor | None = None
@@ -846,7 +794,6 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
             try:
                 records_iter = self._iter_opinions(set(plan.keys()))
-
                 pending: list[tuple[dict[str, Any], concurrent.futures.Future]] = []
 
                 def submit_next() -> bool:
@@ -861,9 +808,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                     plan_entry = plan[case_id]
 
                     if not self.config.force and self._is_valid_chunk_output(
-                        case_id,
-                        previous.get(case_id),
-                        plan_entry,
+                        case_id, previous.get(case_id), plan_entry
                     ):
                         new_manifest[case_id] = previous[case_id]
                         failures.pop(case_id, None)
@@ -872,22 +817,13 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
                     if executor is None:
                         future: concurrent.futures.Future = concurrent.futures.Future()
-
                         try:
-                            result = chunk_worker(
-                                record,
-                                tokenize,
-                                noise,
-                            )
+                            result = chunk_worker(record, tokenize, noise)
                             future.set_result(result)
                         except Exception as exc:
                             future.set_exception(exc)
-
                     else:
-                        future = executor.submit(
-                            chunk_worker,
-                            record,
-                        )
+                        future = executor.submit(chunk_worker, record)
 
                     pending.append((record, future))
                     return True
@@ -902,7 +838,6 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
                     try:
                         case_id, chunks, error, trace = future.result()
-
                     except Exception as exc:
                         case_id = int(record["cl_opinion_id"])
                         chunks = None
@@ -913,7 +848,6 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
                     if error is not None or chunks is None:
                         failed += 1
-
                         failures[case_id] = {
                             "case_id": case_id,
                             "error": error or "unknown",
@@ -921,51 +855,35 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                             "stage": "chunk",
                             "ts": utc_now(),
                         }
-
                     else:
-                        from .chunker import CORRUPTION_THRESHOLD, corruption_score
+                        from .chunker import quality_filter
 
-                        cscore = corruption_score(chunks)
-
-                        if cscore > CORRUPTION_THRESHOLD:
-                            # Source-level corruption: more than half the
-                            # children end in fragments that cannot be
-                            # repaired by any boundary logic. Log to a
-                            # separate file so pipeline.load() does not
-                            # block on the "unresolved chunking failures"
-                            # precondition — drops are an expected
-                            # outcome, not a failure.
+                        keep, qstats = quality_filter(chunks)
+                        if not keep:
                             drops_path = self.config.chunked_dir / "_corruption_drops.jsonl"
+                            import json as _json
+
                             with drops_path.open("a") as fh:
                                 fh.write(
-                                    json.dumps(
+                                    _json.dumps(
                                         {
                                             "case_id": case_id,
-                                            "score": round(cscore, 4),
-                                            "n_children": sum(
-                                                1 for c in chunks if not c.get("is_parent")
-                                            ),
+                                            **qstats,
                                             "ts": utc_now(),
                                         }
                                     )
                                     + "\n"
                                 )
-
                             logger.warning(
-                                "chunk: dropped case %d (corruption score %.2f > %.2f)",
+                                "chunk: dropped case %d (%s)",
                                 case_id,
-                                cscore,
-                                CORRUPTION_THRESHOLD,
+                                qstats.get("reason"),
                             )
-
-                            failures.pop(case_id, None)
                             dropped += 1
-
+                            failures.pop(case_id, None)
                         else:
                             output_path = self._chunked_file(case_id)
-
                             atomic_write_jsonl(output_path, chunks)
-
                             new_manifest[case_id] = {
                                 "case_id": case_id,
                                 "source_text_hash": plan[case_id].source_text_hash,
@@ -977,7 +895,6 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                                 "file_sha256": sha256_file(output_path),
                                 "completed_at": utc_now(),
                             }
-
                             failures.pop(case_id, None)
 
                     if processed % FAILURE_CHECK_EVERY == 0 or processed + skipped == len(plan):
@@ -999,14 +916,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
                         if self._check_failure_threshold(failed, processed):
                             reason = f"failure threshold exceeded: {failed}/{processed}"
-
-                            self._write_halted(
-                                "chunk",
-                                "systemic",
-                                failed,
-                                processed,
-                            )
-
+                            self._write_halted("chunk", "systemic", failed, processed)
                             raise PipelineError(
                                 "chunk",
                                 "halted",
@@ -1031,9 +941,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
 
             if self._check_failure_threshold(failed, processed):
                 reason = f"failure threshold exceeded: {failed}/{processed}"
-
                 self._write_halted("chunk", "systemic", failed, processed)
-
                 raise PipelineError(
                     "chunk",
                     "halted",
@@ -1047,10 +955,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                     ),
                 )
 
-            orphans = self._cleanup_orphans(
-                self.config.chunked_dir,
-                set(new_manifest.keys()),
-            )
+            orphans = self._cleanup_orphans(self.config.chunked_dir, set(new_manifest.keys()))
 
             if orphans:
                 logger.info("chunk cleaned %d orphan files", orphans)
@@ -1065,24 +970,17 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                 orphans,
             )
 
-            return StageReport(
-                "chunk",
-                processed,
-                skipped,
-                failed,
-                time.monotonic() - started,
-            )
+            return StageReport("chunk", processed, skipped, failed, time.monotonic() - started)
 
     # ── Stage: dedup — cross-case exact-hash dedup ──────────────────
 
     def dedup(self) -> StageReport:
         """Run cross-case deduplication on chunked/.
 
-        After dedup, chunked/_manifest.jsonl reflects the new
-        chunk_count and embedding_count for rewritten cases.
-
-        embedded/_manifest.jsonl retains pre-dedup counts. The next
-        embed run detects the mismatch and re-embeds affected cases.
+        After dedup, chunked/_manifest.jsonl reflects new chunk_count and
+        embedding_count for rewritten cases. embedded/_manifest.jsonl
+        retains pre-dedup counts; next embed detects the mismatch and
+        re-embeds affected cases.
         """
         self._require_open()
 
@@ -1100,7 +998,7 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
             if not (self.config.chunked_dir / "_manifest.jsonl").is_file():
                 raise PipelineError(
                     "dedup",
-                    "chunk must run first (missing chunked/_manifest.jsonl)",
+                    "precondition: chunk must run first (missing chunked/_manifest.jsonl)",
                 )
 
             from .dedup import DedupError, dedup_chunks
@@ -1170,7 +1068,6 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                     "run_all",
                     f"could not drop indexes before forced reload: {exc}",
                 ) from exc
-
         elif database.index_exists():
             raise PipelineError(
                 "run_all",
