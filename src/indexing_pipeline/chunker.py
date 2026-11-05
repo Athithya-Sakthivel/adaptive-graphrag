@@ -63,7 +63,7 @@ from typing import Any
 
 # ── Versioning ──────────────────────────────────────────────────────────
 
-CHUNKER_VERSION = "chunk-v2.7"
+CHUNKER_VERSION = "chunk-v2.8"
 
 
 # ── Default embedder token limit ────────────────────────────────────────
