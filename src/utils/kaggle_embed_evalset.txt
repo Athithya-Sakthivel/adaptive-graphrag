@@ -1,0 +1,464 @@
+# ═══════════════════════════════════════════════════════════════════
+# LegalBench-RAG GPU pre-compute block — FINALIZED (v3)
+#
+# Accelerator: GPU T4 x2. Measured throughput: ~87 docs/s on single T4
+# at seq 128 with SDPA. Full corpus (159,767 chunks) in ~30 min.
+#
+# Produces one tarball uploaded to HF containing:
+#   chunks.parquet   — chunk_id, file_path, char_start, char_end,
+#                       content, embedding (fp16 × 1024)
+#   queries.parquet  — query_id, query, embedding (fp32 × 1024)
+#   manifest.json    — protocol, corpus_hash, counts, model info
+#
+# Key changes vs. previous version:
+#   1. Raw transformers + SDPA + torch.inference_mode() instead of
+#      TorchEmbedder. Measured 87 docs/s vs 3 docs/s (28× speedup).
+#      Reason: SentenceTransformer.encode uses eager attention and
+#      per-doc tokenizer.encode() length guards.
+#   2. Dynamic padding (padding=True) — batches pad to longest in
+#      batch (~130-160 tokens) instead of fixed 512. 3-4× less compute.
+#   3. max_length=1024 truncation limit — 500-char chunks tokenize to
+#      ~125-200 tokens, so no truncation happens in practice.
+#   4. Query embedding is BATCHED (128 at a time) — 6,889 sequential
+#      single-doc calls took ~2 min; batched takes ~5 s.
+#   5. QUERY_PREFIX is prepended explicitly in the batch — matches
+#      retriever.embedder.QueryEmbedder's contract exactly.
+#   6. GPU ghost check — errors loudly if GPU 0 has >20% memory in
+#      use (indicates an abandoned previous kernel; will OOM).
+#   7. Restart-safe — if chunks.parquet + manifest.json exist with
+#      matching corpus_hash, skip everything.
+#   8. Progress with rate + ETA so the user sees it moving.
+# ═══════════════════════════════════════════════════════════════════
+
+import os, sys, json, hashlib, subprocess, time, unicodedata, zipfile
+from pathlib import Path
+
+# ── Config ──────────────────────────────────────────────────────────
+os.environ["HF_TOKEN"] = "hf_a"                     # ← your write token
+HF_USER         = "Athithya117"
+REPO_ID         = f"{HF_USER}/legalbench-artifacts"
+
+CHUNK_SIZE      = 500                # paper's protocol
+EMBED_MAX_LEN   = 1024               # truncation safety limit
+CHUNK_BATCH     = 128                # matches measured 87 docs/s
+QUERY_BATCH     = 128
+EMBEDDING_DIM   = 1024
+
+LEGALBENCH_ROOT = Path("/kaggle/working/legalbench")
+GPU_MODEL_DIR   = Path("/kaggle/working/models/dinghy-law-0.6b-v1")
+REPO_ROOT       = Path("/kaggle/working/adaptive-graphrag")
+OUT_DIR         = Path("/kaggle/working/legalbench_artifacts")
+
+SUBSETS = ("contractnli", "cuad", "maud", "privacy_qa")
+
+# Must match retriever.embedder.QUERY_PREFIX exactly. Both strings
+# are identical in the current codebase; verified by test_e2e.
+QUERY_PREFIX = (
+    "Instruct: Given a web search query, retrieve relevant passages "
+    "that answer the query\nQuery: "
+)
+
+DROPBOX_URL = (
+    "https://www.dropbox.com/scl/fo/r7xfa5i3hdsbxex1w6amw/"
+    "AID389Olvtm-ZLTKAPrw6k4"
+    "?rlkey=5n8zrbk4c08lbit3iiexofmwg&st=0hu354cq&dl=1"
+)
+
+
+def run(cmd, cwd=None):
+    print(f"\n$ {' '.join(str(c) for c in cmd)}")
+    subprocess.run(cmd, cwd=cwd, check=True, env=os.environ)
+
+
+# ── 1. GPU ghost check ──────────────────────────────────────────────
+# If a previous Kaggle kernel was abandoned mid-run, GPU 0 still has
+# 13+ GB of tensors loaded. Loading this run's model then OOMs at
+# batch 128. Only kernel restart fixes this — empty_cache() can't
+# free live tensors.
+import torch
+assert torch.cuda.is_available(), \
+    "GPU not enabled — Settings → Accelerator → GPU T4 x2"
+
+for i in range(torch.cuda.device_count()):
+    with torch.cuda.device(i):
+        free, total = torch.cuda.mem_get_info()
+        used_pct = 100 * (total - free) / total
+        print(f"cuda:{i}  {torch.cuda.get_device_name(i)}  "
+              f"{free/1e9:.1f}GB free / {total/1e9:.1f}GB total "
+              f"({used_pct:.0f}% used)")
+        if used_pct > 20:
+            raise RuntimeError(
+                f"cuda:{i} has {used_pct:.0f}% memory in use. "
+                f"This is a ghost from a previous kernel. "
+                f"Restart the Kaggle kernel (Settings → Restart) "
+                f"before running this block."
+            )
+
+
+# ── 2. Clone repo (idempotent; needed only if we later import
+#     helper modules — currently we don't, but cheap insurance) ─────
+if not (REPO_ROOT / "src").is_dir():
+    run(["git", "clone",
+         "https://github.com/Athithya-Sakthivel/adaptive-graphrag.git",
+         str(REPO_ROOT)])
+
+
+# ── 3. Deps (no-op if already present) ─────────────────────────────
+run([sys.executable, "-m", "pip", "install", "-q",
+     "transformers>=4.40", "safetensors", "pyarrow"])
+
+
+# ── 4. Download corpus (Dropbox; Python zipfile extraction) ────────
+def _find_corpus_and_benchmarks(root: Path) -> tuple[Path, Path]:
+    """Locate corpus/ + benchmarks/ wherever the zip put them."""
+    for corpus in root.rglob("corpus"):
+        if not corpus.is_dir() or not any(corpus.rglob("*.txt")):
+            continue
+        benchmarks = corpus.parent / "benchmarks"
+        if benchmarks.is_dir() and any(benchmarks.glob("*.json")):
+            return corpus, benchmarks
+    raise SystemExit(
+        f"could not locate corpus/ + benchmarks/ under {root}; "
+        f"top-level: {sorted(p.name for p in root.iterdir())}"
+    )
+
+
+def download_legalbench() -> tuple[Path, Path]:
+    LEGALBENCH_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        return _find_corpus_and_benchmarks(LEGALBENCH_ROOT)
+    except SystemExit:
+        pass
+
+    zip_path = Path("/kaggle/working/legalbench.zip")
+    if not zip_path.is_file() or zip_path.stat().st_size < 1_000_000:
+        print("downloading LegalBench-RAG from Dropbox...")
+        run(["curl", "-L", "--fail", "--retry", "3",
+             "-o", str(zip_path), DROPBOX_URL])
+    print(f"  zip: {zip_path.stat().st_size / 1e6:.1f} MB")
+
+    if not zipfile.is_zipfile(zip_path):
+        raise SystemExit(
+            f"downloaded file is not a zip; "
+            f"first bytes: {zip_path.read_bytes()[:200]!r}"
+        )
+
+    # Python zipfile (not unzip) tolerates macOS charset quirks and the
+    # `/` entry that makes `unzip` abort with `mapname: conversion failed`.
+    print("extracting (Python zipfile — not unzip)...")
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(LEGALBENCH_ROOT)
+    zip_path.unlink()
+
+    return _find_corpus_and_benchmarks(LEGALBENCH_ROOT)
+
+
+corpus_dir, bench_dir = download_legalbench()
+print(f"corpus:     {corpus_dir}")
+print(f"benchmarks: {bench_dir}")
+
+
+# ── 5. Verify structure + counts ────────────────────────────────────
+doc_count = 0
+for subset in SUBSETS:
+    sub = corpus_dir / subset
+    if not sub.is_dir():
+        print(f"  WARNING: subset {subset} missing")
+        continue
+    n = sum(1 for _ in sub.rglob("*.txt"))
+    doc_count += n
+    print(f"  {subset:12} {n:>5} docs")
+    assert (bench_dir / f"{subset}.json").is_file(), \
+        f"missing benchmarks/{subset}.json"
+
+total_q = 0
+for subset in SUBSETS:
+    bench = json.loads((bench_dir / f"{subset}.json").read_text())
+    total_q += len(bench["tests"])
+    print(f"  {subset:12} {len(bench['tests']):>5} queries")
+
+print(f"total: {doc_count} docs, {total_q} queries")
+assert 650 <= doc_count <= 750, f"docs: {doc_count} (expected ~714)"
+assert 6000 <= total_q <= 7500, f"queries: {total_q} (expected ~6858)"
+
+
+# ── 6. Download base HF model ───────────────────────────────────────
+if not (GPU_MODEL_DIR / "config.json").is_file():
+    run(["hf", "download", "Hanno-Labs/dinghy-law-0.6b-v1",
+         "--local-dir", str(GPU_MODEL_DIR)])
+assert (GPU_MODEL_DIR / "config.json").is_file(), \
+    f"model missing config.json: {GPU_MODEL_DIR}"
+assert (GPU_MODEL_DIR / "tokenizer.json").is_file(), \
+    f"model missing tokenizer.json: {GPU_MODEL_DIR}"
+print(f"model: {GPU_MODEL_DIR}")
+
+
+# ── 7. Chunk the corpus (deterministic, matches the paper) ──────────
+def _normalise(p: str) -> str:
+    return unicodedata.normalize("NFC", p.replace("\\", "/"))
+
+
+def _is_junk(path: Path) -> bool:
+    return path.name.startswith("._") or "__MACOSX" in path.parts
+
+
+def _fingerprint(corpus_root: Path) -> str:
+    """Must match legalbench_rag.corpus_fingerprint exactly."""
+    d = hashlib.sha256()
+    d.update(b"legalbench-naive-char-500-no-overlap-v1\0")
+    for p in sorted(corpus_root.rglob("*.txt")):
+        if _is_junk(p):
+            continue
+        rel = _normalise(p.relative_to(corpus_root).as_posix())
+        d.update(rel.encode()); d.update(b"\0")
+        d.update(p.read_text(encoding="utf-8").encode()); d.update(b"\0")
+    return d.hexdigest()
+
+
+corpus_hash = _fingerprint(corpus_dir)
+print(f"corpus fingerprint: {corpus_hash[:16]}...")
+
+chunks: list[tuple[str, str, int, int, str]] = []
+for path in sorted(corpus_dir.rglob("*.txt")):
+    if _is_junk(path):
+        continue
+    doc = _normalise(path.relative_to(corpus_dir).as_posix())
+    content = path.read_text(encoding="utf-8")
+    for start in range(0, len(content), CHUNK_SIZE):
+        end = min(start + CHUNK_SIZE, len(content))
+        text = content[start:end]
+        if not text:
+            continue
+        cid = hashlib.sha256(f"{doc}\0{start}\0{end}".encode()).hexdigest()
+        chunks.append((cid, doc, start, end, text))
+
+print(f"chunks: {len(chunks)}")
+assert 100_000 < len(chunks) < 250_000, \
+    f"chunk count {len(chunks)} outside expected band"
+
+
+# ── 8. Queries (extract once, before the restart-safe check) ────────
+queries: list[tuple[str, str]] = []
+for subset in SUBSETS:
+    bench = json.loads((bench_dir / f"{subset}.json").read_text())
+    for idx, test in enumerate(bench["tests"]):
+        queries.append((f"{subset}/{idx:05d}", test["query"]))
+
+print(f"queries: {len(queries)}")
+
+
+# ── 9. Restart-safety check ─────────────────────────────────────────
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+manifest_path = OUT_DIR / "manifest.json"
+chunks_parquet = OUT_DIR / "chunks.parquet"
+queries_parquet = OUT_DIR / "queries.parquet"
+
+if manifest_path.is_file() and chunks_parquet.is_file() and queries_parquet.is_file():
+    existing = json.loads(manifest_path.read_text())
+    if (existing.get("corpus_hash") == corpus_hash
+        and existing.get("chunks") == len(chunks)
+        and existing.get("queries") == len(queries)):
+        print("artifacts already present and match; skipping embed + parquet")
+        SKIP = True
+    else:
+        print("manifest mismatch; rebuilding")
+        SKIP = False
+else:
+    SKIP = False
+
+
+# ── 10. Load model + tokenizer (raw transformers + SDPA) ────────────
+# TorchEmbedder wraps SentenceTransformer which uses eager attention
+# (OOM at batch 512) and per-doc tokenizer.encode() length guards
+# (~13 min overhead on 160K chunks). Raw transformers is what the
+# 87 docs/s benchmark measured.
+if not SKIP:
+    from transformers import AutoModel, AutoTokenizer
+    import numpy as np
+
+    tok = AutoTokenizer.from_pretrained(GPU_MODEL_DIR, local_files_only=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    model = AutoModel.from_pretrained(
+        GPU_MODEL_DIR,
+        dtype=torch.float16,
+        attn_implementation="sdpa",
+        local_files_only=True,
+    ).to("cuda:0").eval()
+
+    def embed_batch(texts: list[str]) -> np.ndarray:
+        """One forward pass. Dynamic padding — batches pad to longest
+        in batch (~130-160 tokens for 500-char chunks), not to
+        max_length. Returns (len(texts), 1024) fp32 L2-normalised."""
+        enc = tok(
+            texts, padding=True, truncation=True,
+            max_length=EMBED_MAX_LEN, return_tensors="pt",
+        )
+        enc = {k: v.to("cuda:0") for k, v in enc.items()}
+        with torch.inference_mode():
+            out = model(**enc).last_hidden_state
+        lengths = enc["attention_mask"].sum(dim=1) - 1
+        pooled = out[torch.arange(out.size(0), device="cuda:0"), lengths]
+        pooled = torch.nn.functional.normalize(pooled.float(), p=2, dim=1)
+        return pooled.cpu().numpy()
+
+    # Warmup (populates CUDA kernels; ~2s)
+    _ = embed_batch(["warmup"] * CHUNK_BATCH)
+    torch.cuda.synchronize()
+
+
+# ── 11. Embed chunks (batched, progress, restart-safe) ──────────────
+if not SKIP:
+    print(f"\nembedding {len(chunks)} chunks on cuda:0...")
+    emb_path = OUT_DIR / "chunk_embeddings_fp16.npy"
+    mm = np.lib.format.open_memmap(
+        emb_path, mode="w+", dtype=np.float16,
+        shape=(len(chunks), EMBEDDING_DIM),
+    )
+
+    t0 = time.monotonic()
+    for i in range(0, len(chunks), CHUNK_BATCH):
+        batch = chunks[i:i + CHUNK_BATCH]
+        vecs = embed_batch([c[4] for c in batch])
+        assert vecs.shape == (len(batch), EMBEDDING_DIM), \
+            f"bad shape {vecs.shape} at batch {i}"
+        mm[i:i + len(batch)] = vecs.astype(np.float16)
+
+        if (i // CHUNK_BATCH) % 20 == 0:
+            done = i + len(batch)
+            elapsed = time.monotonic() - t0
+            rate = done / elapsed if elapsed else 0
+            eta = (len(chunks) - done) / rate if rate else 0
+            print(f"  {done:>6}/{len(chunks)}  "
+                  f"{rate:>5.1f}/s  ETA {eta/60:>5.1f} min")
+
+    mm.flush(); del mm
+    print(f"  chunks embedded in "
+          f"{(time.monotonic() - t0)/60:.1f} min")
+
+
+# ── 12. Embed queries (batched, with QUERY_PREFIX) ─────────────────
+# Critical: QUERY_PREFIX must be prepended here to match
+# retriever.embedder.QueryEmbedder.embed_query(text) which does
+# `embed(QUERY_PREFIX + text)`. Docs are embedded bare (no prefix).
+# Asymmetric embedding — queries get instruction, docs don't.
+if not SKIP:
+    print(f"\nembedding {len(queries)} queries on cuda:0...")
+    q_emb_path = OUT_DIR / "query_embeddings_fp32.npy"
+    q_mm = np.lib.format.open_memmap(
+        q_emb_path, mode="w+", dtype=np.float32,
+        shape=(len(queries), EMBEDDING_DIM),
+    )
+
+    prefixed = [QUERY_PREFIX + q[1] for q in queries]
+
+    t0 = time.monotonic()
+    for i in range(0, len(queries), QUERY_BATCH):
+        batch = prefixed[i:i + QUERY_BATCH]
+        vecs = embed_batch(batch)
+        assert vecs.shape == (len(batch), EMBEDDING_DIM), \
+            f"bad shape {vecs.shape} at batch {i}"
+        q_mm[i:i + len(batch)] = vecs
+
+        if (i // QUERY_BATCH) % 10 == 0:
+            done = i + len(batch)
+            print(f"  {done}/{len(queries)}")
+
+    q_mm.flush(); del q_mm
+    print(f"  queries embedded in "
+          f"{(time.monotonic() - t0)/60:.1f} min")
+
+
+# ── 13. Package as parquet ──────────────────────────────────────────
+if not SKIP:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    print("\npackaging parquet...")
+
+    # fp16 in parquet halves file size with no measurable recall loss.
+    # pgvector's vector(1024) column stores fp32, so the fp16 → fp32
+    # cast happens on load. Distance math is fp32 regardless.
+    emb_fp16 = np.load(OUT_DIR / "chunk_embeddings_fp16.npy")
+    q_emb_fp32 = np.load(OUT_DIR / "query_embeddings_fp32.npy")
+
+    pq.write_table(
+        pa.table({
+            "chunk_id":   [c[0] for c in chunks],
+            "file_path":  [c[1] for c in chunks],
+            "char_start": pa.array([c[2] for c in chunks], type=pa.int32()),
+            "char_end":   pa.array([c[3] for c in chunks], type=pa.int32()),
+            "content":    [c[4] for c in chunks],
+            "embedding":  pa.FixedSizeListArray.from_arrays(
+                pa.array(emb_fp16.ravel(), type=pa.float16()),
+                EMBEDDING_DIM,
+            ),
+        }),
+        OUT_DIR / "chunks.parquet",
+        compression="zstd",
+    )
+    pq.write_table(
+        pa.table({
+            "query_id":  [q[0] for q in queries],
+            "query":     [q[1] for q in queries],
+            "embedding": pa.FixedSizeListArray.from_arrays(
+                pa.array(q_emb_fp32.ravel(), type=pa.float32()),
+                EMBEDDING_DIM,
+            ),
+        }),
+        OUT_DIR / "queries.parquet",
+        compression="zstd",
+    )
+
+    manifest = {
+        "schema_version": 1,
+        "protocol": "legalbench-naive-char-500-no-overlap-v1",
+        "chunk_size": CHUNK_SIZE,
+        "overlap": 0,
+        "corpus_hash": corpus_hash,
+        "documents": doc_count,
+        "chunks": len(chunks),
+        "queries": len(queries),
+        "embedding_model": "Hanno-Labs/dinghy-law-0.6b-v1",
+        "embedding_dim": EMBEDDING_DIM,
+        "chunk_embedding_dtype": "fp16",   # parquet storage
+        "query_embedding_dtype": "fp32",
+        "query_prefix_applied": True,
+        "query_prefix_len": len(QUERY_PREFIX),
+        "subsets": list(SUBSETS),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    # Cleanup intermediate .npy (only parquet ships)
+    (OUT_DIR / "chunk_embeddings_fp16.npy").unlink()
+    (OUT_DIR / "query_embeddings_fp32.npy").unlink()
+
+    print(f"  chunks.parquet:  "
+          f"{(OUT_DIR / 'chunks.parquet').stat().st_size / 1e6:.0f} MB")
+    print(f"  queries.parquet: "
+          f"{(OUT_DIR / 'queries.parquet').stat().st_size / 1e6:.0f} MB")
+
+
+# ── 14. Tar + upload ────────────────────────────────────────────────
+tar_path = Path("/kaggle/working/legalbench_artifacts.tar.gz")
+run(["tar", "-czf", str(tar_path), "-C", str(OUT_DIR), "."])
+print(f"tarball: {tar_path.stat().st_size / 1e6:.0f} MB")
+
+subprocess.run(
+    ["hf", "repos", "create", REPO_ID,
+     "--repo-type", "dataset", "--private", "--exist-ok"],
+    check=False, env=os.environ,
+)
+
+run(["hf", "upload", REPO_ID, str(tar_path),
+     "legalbench_artifacts.tar.gz", "--repo-type", "dataset"])
+
+from huggingface_hub import HfApi
+api = HfApi(token=os.environ["HF_TOKEN"])
+files = list(api.list_repo_files(REPO_ID, repo_type="dataset"))
+assert "legalbench_artifacts.tar.gz" in files
+
+print(f"\n✓ uploaded: https://huggingface.co/datasets/{REPO_ID}")
+print(f"  chunks: {len(chunks)}  queries: {len(queries)}")
+print(f"  size:   {tar_path.stat().st_size / 1e6:.0f} MB")

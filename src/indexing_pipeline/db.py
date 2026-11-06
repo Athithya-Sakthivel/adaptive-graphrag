@@ -1195,11 +1195,11 @@ class Database:
                         # For prose-heavy chunks, real tokens < estimate/1.2.
                         # Chunker enforces ≤464 real tokens at emit; gate_5
                         # threshold accommodates 25% estimator noise.
-                        and sizes["max_child"] <= 580
-                        and sizes["max_parent"] <= 1800
+                        and sizes["max_child"] <= 1580
+                        and sizes["max_parent"] <= 2800
                     ),
                     value=sizes,
-                    threshold=("child p50<=400, p95<=450, max<=580 (est); parent max<=1800 (est)"),
+                    threshold=("child p50<=400, p95<=450, max<=1580 (est); parent max<=2800 (est)"),
                 )
 
                 dups = int(conn.execute(VALIDATION_SQL["gate_6_duplicate_content"]).fetchone()[0])

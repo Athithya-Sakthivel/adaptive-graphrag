@@ -251,3 +251,4 @@ dinghy_law_onnx_int8_weight_only
 openvino_export.log
 embedders
 dinghy_law_openvino_fp16
+legalbench_artifacts
