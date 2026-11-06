@@ -126,22 +126,24 @@ _OPINION_ID_PATTERN = re.compile(
 # Order matters: Ex parte forms are tried first so that queries like
 # "Ex parte Young v. United States" capture the Ex parte styling
 # rather than the trailing v. form.
+_CAP = r"[A-Z][\w.&'-]*"
+_CONN = r"(?:of|the|in|for|at|and|&|de|la|von|der)"
+# A name body: cap-word, optionally followed by (connective? cap-word)
+# groups. The "connective followed by cap-word" structure prevents
+# trailing connectives like "Brown v. Board and the" — the optional
+# group only matches when a capitalized word actually follows.
+_NAME_BODY = rf"{_CAP}(?:(?:\s+{_CONN})?\s+{_CAP}){{0,6}}"
+
 _CASE_REFERENCE_PATTERNS = (
     # "Ex parte X" / "Ex rel. X" / "In re X" / "Matter of X"
     re.compile(
-        r"\b((?:Ex\s+parte|Ex\s+rel\.?|In\s+re|Matter\s+of)\s+"
-        r"[A-Z][\w.&'-]*(?:\s+[A-Z][\w.&'-]*){0,4})",
+        rf"\b((?:Ex\s+parte|Ex\s+rel\.?|In\s+re|Matter\s+of)\s+{_NAME_BODY})",
         re.UNICODE,
     ),
-    # "X v. Y" / "X v Y" / "X vs. Y" / "X versus Y"
-    # The v-token accepts: "v", "v.", "vs", "vs.", "versus".
-    # The leading article strip prevents "The"/"A"/"An" from being
-    # captured as part of the case name.
+    # "X v. Y" / "X vs. Y" / "X versus Y"
     re.compile(
-        r"\b(?:The\s+|A\s+|An\s+)?"
-        r"([A-Z][\w.&'-]*(?:\s+[A-Z][\w.&'-]*){0,4}"
-        r"\s+v(?:\.|s\.?|ersus)?\s+"
-        r"[A-Z][\w.&'-]*(?:\s+[A-Z][\w.&'-]*){0,4})",
+        rf"\b(?:The\s+|A\s+|An\s+)?"
+        rf"({_NAME_BODY}\s+v(?:\.|s\.?|ersus)?\s+{_NAME_BODY})",
         re.UNICODE,
     ),
 )
