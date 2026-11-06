@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -20,6 +21,9 @@ EXIT_PRECONDITION = 3
 EXIT_CONFIG = 4
 
 logger = logging.getLogger("indexing_pipeline.cli")
+
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 SUBCOMMANDS = (
     "manifest",

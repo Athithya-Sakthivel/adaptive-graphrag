@@ -103,6 +103,7 @@ python -m indexing_pipeline.cli index --log-level INFO 2>&1 | tee /tmp/index.log
 
 cd /workspace
 source /workspace/src/utils/.venv/bin/activate
+
 python3 src/utils/inspect_chunks.py \
   --chunked-dir /workspace/tmp/data/chunked \
   --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16
@@ -115,10 +116,9 @@ python3 src/utils/inspect_graph.py
 
 
 mkdir -p /workspace/src/indexing_pipeline/embedder
-
 hf download Athithya117/dinghy-law-0.6b-v1-openvino-fp16 \
   --repo-type model \
-  --local-dir /workspace/src/indexing_pipeline/embedder
+  --local-dir /workspace/src/indexing_pipeline/embedders
 
 
 find src \

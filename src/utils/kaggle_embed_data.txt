@@ -20,13 +20,13 @@ import sys
 import subprocess
 
 # ── Secrets ─────────────────────────────────────────────────────────
-os.environ["HF_TOKEN"]     = "hf_...."           # ← your write token
+os.environ["HF_TOKEN"]     = "hf_a"           # ← your write token
 os.environ["HF_USER_NAME"] = "Athithya117"
 assert os.environ["HF_TOKEN"].startswith("hf_"), "HF_TOKEN not set"
 
 # ── Config ──────────────────────────────────────────────────────────
-DOWNLOAD_SCALE  = "min"
-CORPUS_ROWS     = "200"
+DOWNLOAD_SCALE  = "medium"
+CORPUS_ROWS     = "100000"
 BASE_MODEL_ID   = "Hanno-Labs/dinghy-law-0.6b-v1"
 CHUNK_WORKERS   = "3"
 EMBED_BATCH_GPU = "128"
@@ -53,43 +53,66 @@ sha = subprocess.check_output(
 ).strip()
 print(f"clone: {sha} (latest main)")
 
-# ── 2. Verify all five required fixes ───────────────────────────────
+# ── 2. Verify required fixes ────────────────────────────────────────
+import re
+import ast as _ast
+
 helpers_src  = open(HELPERS).read()
 pipeline_src = open(PIPELINE).read()
 embedder_src = open(EMBEDDER).read()
 
 missing: list[str] = []
+
+# 1. Parenthesized except clause
 if "except (TypeError, ValueError, OverflowError):" not in helpers_src:
     missing.append("pipeline_helpers: parenthesized except")
-if "def worker_init(model_dir_str: str, gpu_model_dir_str" not in helpers_src:
-    missing.append("pipeline_helpers: worker_init gpu_model_dir_str")
-if "initargs=(str(self.config.model_dir), str(self.config.gpu_model_dir))" not in pipeline_src:
-    missing.append("pipeline: ProcessPoolExecutor initargs")
+
+# 2. worker_init accepts gpu_model_dir_str
+if not re.search(r"def\s+worker_init\s*\([^)]*gpu_model_dir_str", helpers_src, re.DOTALL):
+    missing.append("pipeline_helpers: worker_init missing gpu_model_dir_str")
+
+# 3. initargs passes both model dirs (AST-based)
+try:
+    _tree = _ast.parse(pipeline_src)
+except SyntaxError as _e:
+    missing.append(f"pipeline: syntax error: {_e}")
+else:
+    _has_initargs = False
+    for _n in _ast.walk(_tree):
+        if isinstance(_n, _ast.Call) and getattr(_n.func, "attr", "") == "ProcessPoolExecutor":
+            for _kw in _n.keywords:
+                if _kw.arg == "initargs" and isinstance(_kw.value, _ast.Tuple):
+                    _segs = [
+                        _ast.get_source_segment(pipeline_src, e) or ""
+                        for e in _kw.value.elts
+                    ]
+                    if (any("model_dir" in s for s in _segs)
+                        and any("gpu_model_dir" in s for s in _segs)):
+                        _has_initargs = True
+    if not _has_initargs:
+        missing.append("pipeline: initargs missing model_dir/gpu_model_dir")
+
+# 4. MULTI_GPU_MIN_TEXTS threshold
 if "MULTI_GPU_MIN_TEXTS = 20_000" not in embedder_src:
     missing.append("embedder: MULTI_GPU_MIN_TEXTS = 20_000")
+
+# 5. empty_cache guard
 if 'self.device.startswith("cuda") and self._pool is None' not in embedder_src:
-    missing.append("embedder: empty_cache guarded behind pool-is-None")
+    missing.append("embedder: empty_cache not guarded behind pool-is-None")
 
 if missing:
     for m in missing:
         print(f"MISSING FIX on origin/main: {m}")
-    raise SystemExit(
-        "origin/main is missing required fixes — push from laptop and re-run"
-    )
+    raise SystemExit("origin/main is missing required fixes — push from laptop and re-run")
 
-subprocess.run(
-    [sys.executable, "-c",
-     f"import ast; "
-     f"ast.parse(open('{HELPERS}').read()); "
-     f"ast.parse(open('{PIPELINE}').read()); "
-     f"ast.parse(open('{EMBEDDER}').read())"],
-    check=True,
-)
-print("fixes present: except, worker_init, initargs, "
-      "MULTI_GPU_MIN_TEXTS=20k, empty_cache guard")
+# Final syntax validation of all three files
+_ast.parse(helpers_src)
+_ast.parse(pipeline_src)
+_ast.parse(embedder_src)
+
+print("fixes present: except, worker_init, initargs, MULTI_GPU_MIN_TEXTS=20k, empty_cache guard")
 print(f"embed device: {EMBED_DEVICE} (single GPU)")
 
-!sudo apt update && sudo apt install -y python3.14-dev build-essential && pip install eyecite==2.7.8
 
 # ── 3. Install deps ─────────────────────────────────────────────────
 %pip install -q 'psycopg[binary]>=3.2,<4.0' 'psycopg-pool>=3.2,<4.0'
@@ -207,38 +230,87 @@ norm = sum(x * x for x in vec) ** 0.5
 assert abs(norm - 1.0) < 1e-3, f"vector not L2-normalized: norm={norm}"
 print(f"sample vector: dims={len(vec)}  L2 norm={norm:.4f}")
 
-# ── 10. Upload chunked/ + embedded/ to private HF dataset ───────────
+# ── 10. Upload chunked/ + embedded/ as tarballs ─────────────────────
+#
+# Per-file upload hits HF's per-request rate limit (~1000 req/5min per IP).
+# 1553 cases × 2 files + metadata = ~3100 files × 2 requests each (GET+HEAD)
+# = ~6200 requests → unavoidable 429 storm.
+#
+# Tarball approach: 2 tarballs, 2 uploads, ~2 requests total. The laptop
+# extracts them and gets the exact same per-case JSONL layout.
+#
+# We also delete any stale per-file artifacts from previous runs, so the
+# repo contains only the tarballs going forward.
+
 print(f"\nuploading to {REPO_ARTIFACTS} ...")
 
+# Ensure repo exists (use the non-deprecated `hf repos create`)
 subprocess.run(
-    ["hf", "repo", "create", REPO_ARTIFACTS,
+    ["hf", "repos", "create", REPO_ARTIFACTS,
      "--repo-type", "dataset", "--private", "--exist-ok"],
     check=False, env=os.environ,
 )
 
-run(["hf", "upload-large-folder", REPO_ARTIFACTS, DATA,
-     "--repo-type", "dataset",
-     "--exclude", "raw/**",
-     "--exclude", "manifest/**",
-     "--exclude", "reports/**",
-     "--exclude", "*.lock",
-     "--exclude", ".cache/**",
-     "--exclude", "**/.cache/**"])
+# Package as tarballs
+print("packaging artifacts as tarballs...")
+tarballs = [
+    ("chunked.tar.gz", "chunked"),
+    ("embedded.tar.gz", "embedded"),
+]
+for tarball_name, subdir in tarballs:
+    tarball_path = f"{DATA}/{tarball_name}"
+    run(["tar", "-czf", tarball_path, "-C", DATA, subdir])
+    size_mb = os.path.getsize(tarball_path) / 1e6
+    print(f"  {tarball_name}: {size_mb:.1f} MB")
+
+# Upload both tarballs (2 requests)
+for tarball_name, _ in tarballs:
+    run(["hf", "upload", REPO_ARTIFACTS,
+         f"{DATA}/{tarball_name}", tarball_name,
+         "--repo-type", "dataset"])
 
 # Verify upload
 from huggingface_hub import HfApi
 
 api = HfApi(token=os.environ["HF_TOKEN"])
 remote_files = list(api.list_repo_files(REPO_ARTIFACTS, repo_type="dataset"))
-remote_chunked  = sum(1 for f in remote_files
-                      if f.startswith("chunked/")  and f.endswith(".jsonl"))
-remote_embedded = sum(1 for f in remote_files
-                      if f.startswith("embedded/") and f.endswith(".jsonl"))
-print(f"\nremote chunked: {remote_chunked}  embedded: {remote_embedded}")
-assert remote_chunked  >= len(case_files),     "chunked upload incomplete"
-assert remote_embedded >= len(embedded_files), "embedded upload incomplete"
-assert "embedded/_manifest.jsonl" in remote_files, "embedded/_manifest.jsonl not uploaded"
-assert "chunked/_manifest.jsonl"  in remote_files, "chunked/_manifest.jsonl not uploaded"
+
+for tarball_name, _ in tarballs:
+    assert tarball_name in remote_files, f"{tarball_name} not uploaded"
+print(f"\nremote tarballs: {sorted(f for f in remote_files if f.endswith('.tar.gz'))}")
+
+# Clean up stale per-file artifacts from prior runs. `delete_patterns`
+# batches this into a single commit (1 request) regardless of file count.
+stale_files = [
+    f for f in remote_files
+    if (f.startswith("chunked/") or f.startswith("embedded/")) and f.endswith(".jsonl")
+]
+if stale_files:
+    print(f"deleting {len(stale_files)} stale per-file artifacts from previous runs...")
+    try:
+        api.delete_files(
+            repo_id=REPO_ARTIFACTS,
+            repo_type="dataset",
+            delete_patterns=["chunked/*.jsonl", "embedded/*.jsonl"],
+            commit_message="remove per-file artifacts (superseded by tarballs)",
+        )
+        print("  stale files deleted")
+    except Exception as exc:
+        print(f"  WARNING: could not delete stale files: {type(exc).__name__}: {exc}")
+        print("  (harmless — laptop download script only fetches tarballs)")
+
+# Summary
+print(f"\nlocal chunked: {len(case_files)}  embedded: {len(embedded_files)}")
+for tarball_name, _ in tarballs:
+    size_mb = os.path.getsize(f"{DATA}/{tarball_name}") / 1e6
+    print(f"  uploaded {tarball_name}: {size_mb:.1f} MB")
+
+# Clean up local tarballs (they're on HF now; laptop re-downloads)
+for tarball_name, _ in tarballs:
+    try:
+        os.remove(f"{DATA}/{tarball_name}")
+    except FileNotFoundError:
+        pass
 
 print()
 print("✓ Block 2 complete.")
