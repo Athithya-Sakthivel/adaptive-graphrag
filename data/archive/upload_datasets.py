@@ -57,7 +57,7 @@ from huggingface_hub.utils import HfHubHTTPError  # noqa: E402
 
 VALID_SIZES = {"min", "medium", "max"}
 REPO_ID = "adaptive-graphrag-datasets"   # no suffix — one repo
-DEFAULT_DIR = "/workspace/tmp/data/raw"
+DEFAULT_DIR = "/workspace/tmp/data-medium/raw"
 
 
 def log(msg: str) -> None:

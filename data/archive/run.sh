@@ -11,7 +11,7 @@ export HF_TOKEN=$HF_TOKEN # https://huggingface.co/settings/tokens/new?tokenType
 export HF_USER_NAME=Athithya117
 export DATASET_SIZE=medium
 
-python3 download_datasets.py --dir /workspace/tmp/data/raw --scale $DATASET_SIZE
+python3 download_datasets.py --dir /workspace/tmp/data-medium/raw --scale $DATASET_SIZE
 
 
 python3 upload_datasets.py
