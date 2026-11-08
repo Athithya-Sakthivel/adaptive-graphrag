@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyi
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.git/
+.gitignore
+.venv/
+venv/
+data/
+test_dense.sh
+prepare-model.sh
+README.md

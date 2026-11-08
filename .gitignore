@@ -252,3 +252,7 @@ openvino_export.log
 embedders
 dinghy_law_openvino_fp16
 legalbench_artifacts
+
+
+
+src/openobserve/data
