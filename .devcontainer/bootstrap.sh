@@ -118,6 +118,10 @@ python3 -m pip install --break-system-packages --ignore-installed -q \
   pre-commit==4.2.0 \
   huggingface_hub==2.4.0 \
 
+apt-get update
+
+apt-get install -y python3.14-dev
+
 
 # ===========================================================================
 # 5. Pre-commit hooks

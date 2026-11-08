@@ -117,8 +117,7 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
         "--model-dir",
         type=Path,
         default=None,
-        help="override CPU model directory "
-        "(default: <package>/embedders/dinghy-law-0.6b-v1-openvino-fp16)",
+        help="override CPU model directory (default: <package>/embedders)",
     )
     p.add_argument(
         "--gpu-model-dir",

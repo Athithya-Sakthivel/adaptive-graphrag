@@ -53,7 +53,7 @@ _PKG_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _PKG_DIR.parent.parent
 
 DEFAULT_DATA_DIR = _REPO_ROOT / "tmp" / "data"
-DEFAULT_MODEL_DIR = _PKG_DIR / "embedders" / "dinghy-law-0.6b-v1-openvino-fp16"
+DEFAULT_MODEL_DIR = _PKG_DIR / "embedders"
 DEFAULT_GPU_MODEL_DIR = _PKG_DIR / "models" / "dinghy-law-0.6b-v1"
 
 

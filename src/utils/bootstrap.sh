@@ -1,9 +1,8 @@
 
-
-mkdir -p /workspace/src/indexing_pipeline/embedder
-hf download Athithya117/dinghy-law-0.6b-v1-openvino-fp16 \
+hf download Athithya117/bge-small-en-v1.5-openvino-qint8 \
   --repo-type model \
   --local-dir /workspace/src/indexing_pipeline/embedders
+
 
 docker run -d \
   --name legal-pgvector \
@@ -30,9 +29,10 @@ docker run -d \
   -c random_page_cost=1.1 \
   -c effective_io_concurrency=200
 
-cd /workspace/src && source .venv/bin/activate
+
+cd /workspace/src && python3 -m venv .venv && source .venv/bin/activate
 pip install -r indexing_pipeline/requirements.txt
 
-python3 data/download_raw_data.py --dir /workspace/tmp/data/raw \
+python3 ../data/download_raw_data.py --dir /workspace/tmp/data/raw \
     --scale medium \
     --force

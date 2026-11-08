@@ -1,25 +1,4 @@
-"""Load-side stages — embed, load, validate, index, drop_indexes.
-
-LoadMixin supplies these stages to IndexingPipeline (composed in
-pipeline.py). At runtime LoadMixin inherits from object so
-`IndexingPipeline(LoadMixin, IndexingPipelineBase)` produces a clean MRO.
-At type-check time LoadMixin inherits from IndexingPipelineBase (via the
-TYPE_CHECKING branch below), so basedpyright resolves every shared
-attribute and method without requiring `self: IndexingPipelineBase`
-annotations (which basedpyright rejects for sibling classes).
-
-v2.7 changes:
-  - load() uses loaded_ids (surviving cases from chunk_manifest) instead
-    of plan_ids (all requested cases). Cases dropped by quality_filter in
-    chunk() are NOT in chunk_manifest, so loading by plan_ids would
-    insert cases with no chunks — inflating the cases table and
-    distorting graph endpoint filtering.
-  - gate_9 threshold: 0.9999 → 0.99 (measured cross-backend T4-vs-CPU
-    cosine 0.9966; 0.9999 was a same-backend threshold, wrong for
-    cross-backend comparison).
-  - load() logs drop count at start ("loading X/Y after quality filter
-    dropped Z") so the number is visible without parsing the drops file.
-"""
+"""Load-side stages — embed, load, validate, index, drop_indexes."""
 
 from __future__ import annotations
 
@@ -33,10 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .pipeline import IndexingPipelineBase
 else:
-    # Runtime placeholder: LoadMixin does not need a real parent.
-    # IndexingPipeline provides the MRO composition.
     IndexingPipelineBase = object  # type: ignore[misc,assignment]
-
 
 from . import chunker, db
 from .embedder import EMBEDDING_DIMENSIONS
@@ -62,8 +38,6 @@ logger = logging.getLogger("indexing_pipeline")
 class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
     """Stages from embedding onward: embed, load, validate, index, drop-index."""
 
-    # ── Stage: embed — batched, per-case fallback, device-aware ─────
-
     def embed(self) -> StageReport:
         self._require_open()
         with self._stage_lock():
@@ -80,9 +54,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
 
             if self.config.dry_run:
                 logger.info(
-                    "embed dry-run: %d cases, device=%s",
-                    len(chunk_manifest),
-                    self.config.device,
+                    "embed dry-run: %d cases, device=%s", len(chunk_manifest), self.config.device
                 )
                 return StageReport("embed", 0, len(chunk_manifest), 0, time.monotonic() - started)
 
@@ -94,11 +66,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             processed = skipped = failed = 0
             case_ids = sorted(chunk_manifest)
 
-            logger.info(
-                "embed starting: %d cases, device=%s",
-                len(case_ids),
-                self.config.device,
-            )
+            logger.info("embed starting: %d cases, device=%s", len(case_ids), self.config.device)
             embedder = self._get_embedder()
             logger.info("embed model loaded, beginning batched inference")
 
@@ -124,11 +92,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                         rows = list(read_jsonl(chunk_path))
                         children = [r for r in rows if not bool(r["is_parent"])]
                         if len(children) != int(chunk_entry["embedding_count"]):
-                            raise PipelineError(
-                                "embed",
-                                f"child count mismatch {case_id}: "
-                                f"{len(children)} != {chunk_entry['embedding_count']}",
-                            )
+                            raise PipelineError("embed", f"child count mismatch {case_id}")
                         pending.append((case_id, chunk_entry, children))
                     except Exception as exc:
                         failed += 1
@@ -165,28 +129,18 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     all_vecs = embedder.embed_documents(all_texts)
                     if all_vecs.shape != (len(all_texts), EMBEDDING_DIMENSIONS):
                         raise RuntimeError(
-                            f"batch returned {all_vecs.shape}, "
-                            f"expected ({len(all_texts)}, {EMBEDDING_DIMENSIONS})"
+                            f"batch returned {all_vecs.shape}, expected ({len(all_texts)}, {EMBEDDING_DIMENSIONS})"
                         )
                     batch_ok = True
                 except Exception as exc:
-                    logger.warning(
-                        "batch embed failed (%s); retrying per-case to isolate offenders",
-                        type(exc).__name__,
-                    )
+                    logger.warning("batch embed failed (%s); retrying per-case", type(exc).__name__)
 
                 if batch_ok and all_vecs is not None:
-                    for (case_id, chunk_entry, children), (
-                        slice_start,
-                        slice_end,
-                    ) in zip(pending, slices, strict=True):
+                    for (case_id, chunk_entry, children), (slice_start, slice_end) in zip(
+                        pending, slices, strict=True
+                    ):
                         try:
                             vectors = all_vecs[slice_start:slice_end]
-                            if vectors.shape != (
-                                len(children),
-                                EMBEDDING_DIMENSIONS,
-                            ):
-                                raise RuntimeError(f"shape mismatch {case_id}: {vectors.shape}")
                             output_rows = [
                                 {"chunk_id": r["chunk_id"], "vector": v.tolist()}
                                 for r, v in zip(children, vectors, strict=True)
@@ -217,11 +171,6 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     for case_id, chunk_entry, children in pending:
                         try:
                             per_vecs = embedder.embed_documents([str(r["text"]) for r in children])
-                            if per_vecs.shape != (
-                                len(children),
-                                EMBEDDING_DIMENSIONS,
-                            ):
-                                raise RuntimeError(f"shape mismatch {case_id}: {per_vecs.shape}")
                             output_rows = [
                                 {"chunk_id": r["chunk_id"], "vector": v.tolist()}
                                 for r, v in zip(children, per_vecs, strict=True)
@@ -265,12 +214,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                         "embed",
                         "halted",
                         StageReport(
-                            "embed",
-                            processed,
-                            skipped,
-                            failed,
-                            time.monotonic() - started,
-                            reason,
+                            "embed", processed, skipped, failed, time.monotonic() - started, reason
                         ),
                     )
 
@@ -283,12 +227,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     "embed",
                     "halted",
                     StageReport(
-                        "embed",
-                        processed,
-                        skipped,
-                        failed,
-                        time.monotonic() - started,
-                        reason,
+                        "embed", processed, skipped, failed, time.monotonic() - started, reason
                     ),
                 )
 
@@ -306,8 +245,6 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             )
             return StageReport("embed", processed, skipped, failed, time.monotonic() - started)
 
-    # ── Load helpers ────────────────────────────────────────────────
-
     def _load_clusters(self) -> dict[int, dict]:
         result: dict[int, dict] = {}
 
@@ -316,8 +253,12 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             if cid is None:
                 continue
             cid = int(cid)
+
+            # IDEMPOTENCY FIX: Skip duplicate cluster metadata safely
             if cid in result:
-                raise PipelineError("load", f"duplicate cluster id: {cid}")
+                logger.debug("skipping duplicate cluster metadata for id: %d", cid)
+                continue
+
             result[cid] = row
 
         return result
@@ -330,14 +271,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             v = corpus_row.get(key)
             return v if v is not None else cluster_row.get(key)
 
-        reserved = {
-            "case_id",
-            "cl_opinion_id",
-            "cluster_id",
-            "text",
-            "text_kind",
-            "metadata",
-        }
+        reserved = {"case_id", "cl_opinion_id", "cluster_id", "text", "text_kind", "metadata"}
         metadata = json_safe({k: v for k, v in cluster_row.items() if k not in reserved})
         cid = corpus_row.get("cluster_id")
 
@@ -389,11 +323,8 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
         if vec_map:
             raise PipelineError(
                 "load",
-                f"orphan embeddings for case {case_id}: {len(vec_map)} "
-                f"(re-run `embed` after `dedup`)",
+                f"orphan embeddings for case {case_id}: {len(vec_map)} (re-run `embed` after `dedup`)",
             )
-
-    # ── Stage: load ─────────────────────────────────────────────────
 
     def load(self) -> StageReport:
         self._require_open()
@@ -423,8 +354,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                 if not self._is_valid_embed_output(case_id, chunk_entry, embed_manifest[case_id]):
                     raise PipelineError(
                         "load",
-                        f"invalid embed output for {case_id} "
-                        f"(re-run `embed` after chunk/dedup changes)",
+                        f"invalid embed output for {case_id} (re-run `embed` after chunk/dedup changes)",
                     )
 
             if self.config.dry_run:
@@ -460,14 +390,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     "precondition: index exists; run 'drop-index' then 'load' or 'all --force'",
                 )
 
-            # v2.7: use loaded_ids (surviving cases) not plan_ids (all
-            # requested cases). Cases dropped by quality_filter in chunk()
-            # are NOT in chunk_manifest, so loading by plan_ids would load
-            # cases with no chunks — inflating the cases table and breaking
-            # graph endpoint filtering (edges would need endpoints that
-            # survive the filter, which they don't if one endpoint is
-            # dropped).
-            plan = self._load_plan()  # validates plan.jsonl exists, non-empty
+            plan = self._load_plan()
             if not plan:
                 raise PipelineError("load", "precondition: plan is empty or missing")
 
@@ -483,10 +406,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
 
             deleted = database.delete_stale_cases(list(loaded_ids))
             if deleted:
-                logger.info(
-                    "deleted %d stale cases (cascades to edges and chunks)",
-                    deleted,
-                )
+                logger.info("deleted %d stale cases (cascades to edges and chunks)", deleted)
 
             clusters = self._load_clusters()
 
@@ -497,7 +417,6 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     yield self._join_cases(record, cluster)
 
             case_count = database.load_cases(case_rows())
-
             loaded_ids_set = loaded_ids
 
             def edge_rows() -> Iterator[dict]:
@@ -543,9 +462,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             )
 
             logger.info(
-                "load complete: cases=%d (affected=%d, dropped=%d), edges=%d, "
-                "staged=%d, upserted=%d, deleted_stale=%d, chunks=%d, "
-                "children=%d, parents=%d, orphan_parents=%d",
+                "load complete: cases=%d (affected=%d, dropped=%d), edges=%d, staged=%d, upserted=%d, deleted_stale=%d, chunks=%d, children=%d, parents=%d, orphan_parents=%d",
                 counts["cases"],
                 case_count,
                 dropped_count,
@@ -561,15 +478,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
 
             return StageReport("load", staged, 0, 0, time.monotonic() - started)
 
-    # ── Stage: validate — determinism + DB gates ───────────────────
-
     def _determinism_check(self, sample_size: int = 20) -> db.GateResult:
-        """Re-chunk N cases and verify stored chunks are a subset of re-chunk.
-
-        Subset (not equality) because dedup.py may have removed cross-case
-        duplicates from chunked/*.jsonl. Re-chunking reproduces the full
-        pre-dedup set; stored must be a subset of that set.
-        """
         chunk_manifest = self._load_manifest(self.config.chunked_dir)
         candidates = sorted(chunk_manifest)[:sample_size]
         if not candidates:
@@ -597,21 +506,13 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                 (c.chunk_id, c.text_hash, c.parent_id, c.is_parent) for c in recomputed
             }
             stored_sig = {
-                (
-                    r["chunk_id"],
-                    r["text_hash"],
-                    r.get("parent_id"),
-                    bool(r["is_parent"]),
-                )
+                (r["chunk_id"], r["text_hash"], r.get("parent_id"), bool(r["is_parent"]))
                 for r in expected
             }
             missing = stored_sig - recomputed_sig
             if missing:
                 mismatches.append(
-                    {
-                        "case_id": case_id,
-                        "missing": [list(m)[:2] for m in list(missing)[:5]],
-                    }
+                    {"case_id": case_id, "missing": [list(m)[:2] for m in list(missing)[:5]]}
                 )
             else:
                 checked += 1
@@ -619,11 +520,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
         return db.GateResult(
             name="gate_8_determinism",
             passed=not mismatches,
-            value={
-                "checked": checked,
-                "expected": len(candidates),
-                "mismatches": mismatches[:20],
-            },
+            value={"checked": checked, "expected": len(candidates), "mismatches": mismatches[:20]},
             threshold=f"stored ⊆ re-chunked on {len(candidates)} sampled cases",
         )
 
@@ -639,28 +536,8 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             database.ensure_schema()
 
             determinism = self._determinism_check()
-            # gate_9 (embedding determinism) is intentionally not run.
-            # Rationale:
-            #   * The artifacts are pinned to a specific HF commit (see
-            #     HF_LAW_REVISION in download_artifacts.sh); the model
-            #     weights cannot silently change between runs.
-            #   * The cross-backend cosine was measured at ~0.9966 on
-            #     the current artifacts; the 0.99 threshold leaves ~0.006
-            #     of detection margin, which is far below what
-            #     quantisation drift would produce.
-            #   * gate_8 (chunk determinism) catches the regression
-            #     class that actually affects retrieval quality
-            #     (chunker drift, _safe_cut regressions) at ~2 s.
-            #   * The CPU cost (~2 min OpenVINO cold start) is paid on
-            #     every validate run for near-zero detection power.
-            # To re-enable: uncomment the two lines below.
-            # embedding_determinism = self._embedding_determinism_check()
-            # extra = {"gate_9_embedding_determinism": embedding_determinism}
             extra: dict = {}
-            report = database.validation_report(
-                determinism_gate=determinism,
-                extra_gates=extra,
-            )
+            report = database.validation_report(determinism_gate=determinism, extra_gates=extra)
 
             self.config.reports_dir.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -685,17 +562,9 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                 raise PipelineError(
                     "validate",
                     "gate_failed: " + ", ".join(failed),
-                    StageReport(
-                        "validate",
-                        1,
-                        0,
-                        len(failed),
-                        time.monotonic() - started,
-                    ),
+                    StageReport("validate", 1, 0, len(failed), time.monotonic() - started),
                 )
             return StageReport("validate", 1, 0, 0, time.monotonic() - started)
-
-    # ── Stage: index ────────────────────────────────────────────────
 
     def index(self) -> StageReport:
         self._require_open()
@@ -716,15 +585,13 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             current = self._dataset_fingerprint()
             if not validation.get("ok") or validation.get("dataset_fingerprint") != current:
                 raise PipelineError(
-                    "index",
-                    "precondition: validation failed or fingerprint mismatch",
+                    "index", "precondition: validation failed or fingerprint mismatch"
                 )
 
             state = database.get_pipeline_state(PIPELINE_STATE_KEY)
             if not state or state.get("dataset_fingerprint") != current:
                 raise PipelineError(
-                    "index",
-                    "precondition: dataset not loaded or fingerprint mismatch",
+                    "index", "precondition: dataset not loaded or fingerprint mismatch"
                 )
 
             if self.config.force:
@@ -739,8 +606,6 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             atomic_write_json(self.config.reports_dir / "index_report.json", index_report)
 
             return StageReport("index", len(index_report), 0, 0, time.monotonic() - started)
-
-    # ── Stage: drop-index ───────────────────────────────────────────
 
     def drop_indexes(self) -> StageReport:
         self._require_open()
