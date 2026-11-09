@@ -54,15 +54,15 @@ RUN set -eux; \
         -DGGML_NATIVE=ON \
         -DGGML_OPENMP=ON \
         -DLLAMA_BUILD_SERVER=ON \
+        -DLLAMA_BUILD_EXAMPLES=ON \
         -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_CURL=ON; \
     cmake --build /src/build \
         --config Release \
+        --target llama-server \
         --parallel "${BUILD_JOBS}"; \
-    install -D -m 0755 \
-        /src/build/bin/llama-server \
-        /opt/ik/bin/llama-server; \
+    mkdir -p /opt/ik/bin; \
+    find /src/build -name "llama-server" -type f -exec install -D -m 0755 {} /opt/ik/bin/llama-server \;; \
     mkdir -p /opt/ik/lib; \
     find /src/build -type f -name '*.so*' \
         -exec cp -a -t /opt/ik/lib/ '{}' +; \
