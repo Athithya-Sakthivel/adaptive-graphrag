@@ -1,0 +1,18 @@
+title = "Project Gitleaks Config"
+
+[extend]
+# Inherit all default Gitleaks rules (AWS keys, GitHub PATs, etc.)
+useDefault = true
+
+[[allowlists]]
+description = "Global allowlist for known false positives"
+# Ignore specific strings that trigger the generic-api-key rule but are just variable names
+
+regexes = [
+]
+
+# Ignore entire files that only contain documentation or test data
+paths = [
+    '''docs/rag/datasets\.md''',
+    '''.*\.example'''
+]
