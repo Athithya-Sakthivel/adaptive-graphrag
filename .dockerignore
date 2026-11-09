@@ -17,3 +17,38 @@ README.mdembedder/
 *.parquet
 __pycache__/
 .venv/
+
+# Git
+.git/
+.gitignore
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyi
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+
+# Development data and build artifacts
+**/data/
+**/*.parquet
+
+# Test and preparation scripts
+**/test_dense.sh
+**/prepare-model.sh
+
+# Documentation
+**/README.md
+
+# Exclude model weights by default
+**/*.gguf
+
+# Allow the one GGUF required by the IK LLM image
+!models/
+!models/llm/
+!models/llm/Qwen3.5-0.8B-Q4_K_M.gguf

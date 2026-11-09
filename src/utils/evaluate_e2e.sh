@@ -19,6 +19,8 @@ export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
 export MODEL=/workspace/src/indexing_pipeline/embedders
 export CORPUS_ROWS=10000
 
+# python -m indexing_pipeline.cli drop-index # to index faster
+
 python -m indexing_pipeline.cli all \
   --embed-batch 32 \
   --inference-threads 8 \

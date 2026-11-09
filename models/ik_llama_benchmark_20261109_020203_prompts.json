@@ -1,0 +1,22 @@
+{
+  "created_at_utc": "2026-11-09T02:02:06.079661+00:00",
+  "model": "/workspace/models/llm/Qwen3.5-0.8B-Q4_K_M.gguf",
+  "tokenizer_endpoint": "/tokenize (add_special=true, parse_special=true)",
+  "prompts": [
+    {
+      "target_tokens": 1024,
+      "builder_token_count": 1025,
+      "prompt_sha256": "39b2d32402712258ae2363d7867001cfc6dd2960a7548f791cef8981581169cb"
+    },
+    {
+      "target_tokens": 2048,
+      "builder_token_count": 2049,
+      "prompt_sha256": "7f2a47b71c49aab2817a0edb52daa75eca718bf7e75941a996f511ba5946a9ce"
+    },
+    {
+      "target_tokens": 5120,
+      "builder_token_count": 5119,
+      "prompt_sha256": "ee048fc6a460a08a9f9f6f7953d64f914cc58b498db1a5b32133203dfabd71db"
+    }
+  ]
+}
