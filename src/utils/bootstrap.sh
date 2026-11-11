@@ -15,7 +15,7 @@ docker run -d \
   -v legal_pgdata:/var/lib/postgresql/data \
   pgvector/pgvector:0.8.7-pg17-bookworm@sha256:7d0a41464797aeb9862dfdc0bbf1526b82cfd324cdd8036df19e3545f4a9ccb8 \
   -c shared_buffers=2GB \
-  -c effective_cache_size=5GB \
+  -c effective_cache_size=2GB \
   -c maintenance_work_mem=1GB \
   -c work_mem=16MB \
   -c temp_buffers=16MB \

@@ -3,3 +3,5 @@ embedder/
 *.parquet
 __pycache__/
 .venv/
+models
+data

@@ -9,9 +9,9 @@ sudo apt-get install -y lbzip2
 
 export HF_TOKEN=$HF_TOKEN # https://huggingface.co/settings/tokens/new?tokenType=write
 export HF_USER_NAME=Athithya117
-export DATASET_SIZE=medium
+export DATASET_SIZE=max
 
-python3 download_datasets.py --dir /workspace/tmp/data-medium/raw --scale $DATASET_SIZE
+python3 download_datasets.py --dir /workspace/tmp/data-max/raw --scale $DATASET_SIZE
 
 
 python3 upload_datasets.py

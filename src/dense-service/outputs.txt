@@ -1,0 +1,106 @@
+ => => unpacking to ghcr.io/athithya-sakthivel/dense-embedder:latest                                                              0.0s
+[OK] built ghcr.io/athithya-sakthivel/dense-embedder:2026-11-09-14-12-48--39a6407
+
+==> [verify-image]
+==> verifying OpenVINO IR and module inside ghcr.io/athithya-sakthivel/dense-embedder:2026-11-09-14-12-48--39a6407
+embedder module: OK
+[OK] image contents verified
+
+==> [openobserve]
+==> waiting for OpenObserve healthz
+[OK] openobserve ready
+
+==> [dense]
+[OK] dense-service container started with DENSE_API_KEY
+
+==> [ready]
+==> waiting for readyz up to 120s
+[OK] service ready
+
+==> [http]
+==> checking health endpoint no auth required
+   model_path    = /app/embedder/openvino_model_qint8_quantized.xml
+   backend       = openvino
+   dim           = 384
+   embedder_ver  = bge-small-en-v1.5-openvino-qint8-512
+   otel service  = dense-embedder-test
+   otel endpoint = http://openobserve-dense-test:5080/api/default
+[OK] health contract ok
+==> checking embed auth enforcement
+[OK] auth enforced no key gives 401 wrong key gives 401
+==> checking embed contract document query prefix
+   default mode: 2 vectors x 384 dims L2-normalized
+   explicit document mode matches default
+   query mode: 1 vector x 384 dims L2-normalized
+   prefix applied document != query for identical input text
+[OK] embed contract ok auth document query prefix
+
+==> [telemetry]
+==> driving traffic so metrics and logs have data
+[OK] traces 10 rows
+   - dense-embedder-test / POST /embed http send 30 us
+   - dense-embedder-test / POST /embed http send 46 us
+   - dense-embedder-test / GET /readyz http send 27 us
+[WARN] no logs visible after 15s LoggingHandler may not be attached
+[WARN] no metrics visible after 15s MeterProvider may not be exporting
+
+==> [offline]
+==> restarting with network none
+[OK] model loads and embeds with zero network access
+
+==> [push]
+==> authenticating to GHCR as athithya-sakthivel
+[OK] GHCR authenticated
+==> pushing ghcr.io/athithya-sakthivel/dense-embedder:2026-11-09-14-12-48--39a6407
+The push refers to repository [ghcr.io/athithya-sakthivel/dense-embedder]
+a5883d972f3b: Layer already exists
+44136fa355b3: Already exists
+ecc510c1e359: Layer already exists
+d2004aa96306: Pushed
+6aaf5b0aae75: Layer already exists
+bb8166eb34e6: Layer already exists
+2c972e0e586e: Pushed
+4f4fb700ef54: Layer already exists
+688fd506b7e8: Pushed
+5dd2458e77c2: Pushed
+e6402080e0b4: Pushed
+712df89e83ae: Pushed
+df76fbc2afab: Pushed
+562572564d61: Pushed
+242aa259de93: Pushed
+f71ef29a0e44: Pushed
+2026-11-09-14-12-48--39a6407: digest: sha256:db94a9a2690bcea2a92c68bbf26aa9f5b726152ea53a8cae294719a2fd826945 size: 856
+[OK] pushed ghcr.io/athithya-sakthivel/dense-embedder:2026-11-09-14-12-48--39a6407
+==> pushing ghcr.io/athithya-sakthivel/dense-embedder:latest
+The push refers to repository [ghcr.io/athithya-sakthivel/dense-embedder]
+44136fa355b3: Already exists
+d2004aa96306: Already exists
+ecc510c1e359: Layer already exists
+a5883d972f3b: Layer already exists
+6aaf5b0aae75: Layer already exists
+bb8166eb34e6: Layer already exists
+4f4fb700ef54: Layer already exists
+2c972e0e586e: Layer already exists
+688fd506b7e8: Layer already exists
+5dd2458e77c2: Layer already exists
+e6402080e0b4: Layer already exists
+562572564d61: Layer already exists
+712df89e83ae: Layer already exists
+df76fbc2afab: Layer already exists
+242aa259de93: Layer already exists
+f71ef29a0e44: Layer already exists
+latest: digest: sha256:db94a9a2690bcea2a92c68bbf26aa9f5b726152ea53a8cae294719a2fd826945 size: 856
+[OK] pushed ghcr.io/athithya-sakthivel/dense-embedder:latest
+
+==> [summary]
+
+=========================================
+  BUILD COMPLETE TAG 2026-11-09-14-12-48--39a6407
+=========================================
+  ghcr.io/athithya-sakthivel/dense-embedder:2026-11-09-14-12-48--39a6407
+  ghcr.io/athithya-sakthivel/dense-embedder:latest
+=========================================
+
+Backend: OpenVINO int8 pinned HF revision
+Model:   BAAI/bge-small-en-v1.5 dim=384
+Auth:    DENSE_API_KEY enforced
