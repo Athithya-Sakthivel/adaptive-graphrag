@@ -1,22 +1,18 @@
 """Adapter from the eval framework to the production retriever.
 
-Implements the eval-framework contract:
-
-    build_runtime(*, suite, config_name, exact_baseline, no_graph, rrf_k, overrides)
+Implements the eval-framework runtime contract:
+    build_runtime(*, suite, config_name, exact_baseline, no_graph,
+                  rrf_k, overrides)
     -> EvalRuntime(corpus_fingerprint(), retrieve(query, top_k), close())
 
-Key design points:
+The production retrieval path (retriever.route) is what gets
+measured. QueryEmbedder is loaded once per process; multiple ablation
+conditions share a single instance to avoid repeated cold starts.
 
-    * Route() executes — no parallel router. The production path is what
-      gets measured.
-    * QueryEmbedder is loaded once per process (module-level cache);
-      ablation's 5 conditions share a single instance, avoiding 5× cold start.
-    * Arm filtering uses monkeypatch, not config — route() has no arm-whitelist
-      parameter, and the ablation needs to disable specific arms for A_dense.
-      This is the only pragmatic way to test "dense alone" without forking the
-      router.
-    * Exact baseline uses iterative_scan_mode='off' + ef_search=1000, which
-      makes the dense arm do an exact scan. The HNSW index is bypassed.
+Arm filtering uses monkeypatch — route() has no arm-whitelist
+parameter, and ablations need to disable specific arms. This is the
+only pragmatic way to test "dense alone" or "graph alone" without
+forking the router.
 """
 
 from __future__ import annotations
@@ -29,69 +25,80 @@ from typing import Any
 
 import psycopg
 
-from evals.fingerprint import case_law_fingerprint
+from retriever import Filters, dense, exact, graph, route, sparse
+from retriever.config import RetrieverConfig, default_config
 
-from . import dense, exact, graph, sparse
-from .config import RetrieverConfig, default_config
-from .filters import Filters
-from .router import route
+from .fingerprint import case_law_fingerprint
 
 _DEFAULT_MODEL_DIR = Path(
-    "/workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16"
+    os.environ.get(
+        "RETRIEVER_MODEL_DIR",
+        "/workspace/src/indexing_pipeline/embedders",
+    )
 )
 
 _shared_embedder: Any = None
 
 
 def _get_shared_embedder() -> Any:
-    """Load QueryEmbedder once; share across ablation conditions."""
     global _shared_embedder
     if _shared_embedder is None:
-        from .embedder import QueryEmbedder
+        from retriever.embedder import QueryEmbedder
 
         _shared_embedder = QueryEmbedder(_DEFAULT_MODEL_DIR)
     return _shared_embedder
 
 
-_ALL_ARMS = frozenset({"dense", "sparse", "exact", "graph_1hop", "graph_2hop"})
+_ALL_ARMS = frozenset({"dense", "sparse", "exact", "graph_1hop", "dense_citers"})
 
 
 @contextmanager
 def _arm_filter(disabled: frozenset[str]) -> Iterator[None]:
     """Temporarily replace disabled arms with no-op functions.
 
-    Restores originals on exit, even if route() raises. Safe for eval
-    because eval is single-threaded (no other request can see the
-    patched module while this block is active).
+    dense_citers shares dense.search, so it cannot be disabled
+    independently; requesting it alone raises rather than silently
+    producing un-ablated results.
+
+    Restores originals on exit even if route() raises. Safe for eval
+    because eval is single-threaded.
     """
+    if "dense_citers" in disabled and "dense" not in disabled:
+        raise ValueError(
+            "dense_citers shares dense.search; disable 'dense' to ablate both, "
+            "or add a separate dense_citers hook before ablating it alone"
+        )
+
     saved: dict[str, Any] = {}
+    noop = lambda *a, **k: []
     try:
         if "dense" in disabled:
             saved["dense"] = dense.search
-            dense.search = lambda *a, **k: []  # type: ignore[assignment]
+            dense.search = noop
         if "sparse" in disabled:
             saved["sparse"] = sparse.search
-            sparse.search = lambda *a, **k: []  # type: ignore[assignment]
+            sparse.search = noop
         if "exact" in disabled:
             saved["exact"] = exact.search
-            exact.search = lambda *a, **k: []  # type: ignore[assignment]
-        if {"graph_1hop", "graph_2hop"} & disabled:
+            exact.search = noop
+        if "graph_1hop" in disabled:
             saved["graph"] = graph.search
-            graph.search = lambda *a, **k: []  # type: ignore[assignment]
+            graph.search = noop
         yield
     finally:
-        if "dense" in saved:
-            dense.search = saved["dense"]
-        if "sparse" in saved:
-            sparse.search = saved["sparse"]
-        if "exact" in saved:
-            exact.search = saved["exact"]
-        if "graph" in saved:
-            graph.search = saved["graph"]
+        for key, original in saved.items():
+            if key == "dense":
+                dense.search = original
+            elif key == "sparse":
+                sparse.search = original
+            elif key == "exact":
+                exact.search = original
+            elif key == "graph":
+                graph.search = original
 
 
 class EvalRuntime:
-    """One eval session. Holds connection, embedder (shared), config."""
+    """One eval session. Holds connection, shared embedder, config."""
 
     def __init__(
         self,
@@ -100,11 +107,13 @@ class EvalRuntime:
         no_graph: bool,
         enabled_arms: frozenset[str] | None,
         corpus_hash: str,
+        published_only: bool = False,
     ) -> None:
         self.conn = conn
         self.config = config
         self.no_graph = no_graph
         self.enabled_arms = enabled_arms
+        self.published_only = published_only
         self._corpus_hash = corpus_hash
         self.embedder = _get_shared_embedder()
 
@@ -112,12 +121,10 @@ class EvalRuntime:
         return self._corpus_hash
 
     def _disabled_arms(self) -> frozenset[str]:
-        """Compute the set of arms to disable for this runtime."""
         if self.enabled_arms is not None:
-            # Strict whitelist: disable everything not listed
             return _ALL_ARMS - self.enabled_arms
         if self.no_graph:
-            return frozenset({"graph_1hop", "graph_2hop"})
+            return frozenset({"graph_1hop"})
         return frozenset()
 
     def retrieve(self, query: str, *, top_k: int) -> dict:
@@ -130,7 +137,7 @@ class EvalRuntime:
                 self.conn,
                 self.embedder,
                 query,
-                filters=Filters(),
+                filters=Filters(published_only=self.published_only),
                 top_k=top_k,
                 config=self.config,
             )
@@ -161,7 +168,6 @@ class EvalRuntime:
         }
 
     def close(self) -> None:
-        # Embedder is shared; do NOT close it here.
         self.conn.close()
 
 
@@ -171,52 +177,36 @@ def _build_config(
     rrf_k: int | None,
     overrides: dict,
 ) -> tuple[RetrieverConfig, bool, frozenset[str] | None]:
-    """Translate eval-framework params into a RetrieverConfig.
-
-    Returns (config, no_graph, enabled_arms).
-    """
+    """Translate eval-framework params into a RetrieverConfig."""
     config = default_config()
     no_graph = False
     enabled_arms: frozenset[str] | None = None
 
-    # --- RRF k override: applies to every per-arm k ---
     if rrf_k is not None:
         config = config.with_overrides(
             dense_k=rrf_k,
             sparse_k_holding=rrf_k,
             sparse_k_lookup=rrf_k,
             sparse_k_validity=rrf_k,
-            sparse_k_application=rrf_k,
             exact_k=rrf_k,
             graph_k=rrf_k,
             dense_citers_k=rrf_k,
-            seeds_pass2_k=rrf_k,
-            graph_pass2_k=rrf_k,
         )
 
-    # --- Graph depth from ablation overrides ---
     graph_hops = overrides.get("graph_hops")
     if graph_hops == 0:
         no_graph = True
-        config = config.with_overrides(application_2hop_enabled=False)
-    elif graph_hops == 1:
-        config = config.with_overrides(application_2hop_enabled=False)
-    elif graph_hops == 2:
-        config = config.with_overrides(application_2hop_enabled=True)
 
-    # --- Arm whitelist (A_dense uses this) ---
     arms = overrides.get("enabled_arms")
     if isinstance(arms, list):
         enabled_arms = frozenset(arms)
 
-    # --- Exact baseline: disable HNSW, force exact scan ---
     if exact_baseline:
         config = config.with_overrides(
             iterative_scan_mode="off",
             ef_search=1000,
         )
 
-    # --- Remaining RetrieverConfig fields via overrides ---
     _metadata_keys = {
         "condition_name",
         "candidate_cap",
@@ -236,11 +226,12 @@ def build_runtime(
     suite: str,
     config_name: str,
     exact_baseline: bool,
+    published_only: bool = False,
     no_graph: bool,
     rrf_k: int | None,
     overrides: dict,
 ) -> EvalRuntime:
-    """Factory called by run_eval.py and ablation.py."""
+    """Factory called by run_eval.py."""
     if suite != "custom":
         raise ValueError(f"EvalRuntime requires suite='custom', got {suite!r}")
 
@@ -256,18 +247,17 @@ def build_runtime(
         overrides=overrides,
     )
 
-    # The factory's no_graph param and the config's no_graph must agree.
     no_graph = no_graph or cfg_no_graph
-
     corpus_hash = case_law_fingerprint(conn)
-
-    # Silence the unused config_name warning
-    del config_name
 
     return EvalRuntime(
         conn=conn,
         config=config,
         no_graph=no_graph,
         enabled_arms=enabled_arms,
+        published_only=published_only,
         corpus_hash=corpus_hash,
     )
+
+
+__all__ = ["EvalRuntime", "build_runtime"]

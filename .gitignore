@@ -259,3 +259,4 @@ src/openobserve/data
 models/logs
 
 logs_ik
+outputs.txt

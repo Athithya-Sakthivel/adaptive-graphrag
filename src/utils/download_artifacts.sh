@@ -34,8 +34,12 @@ usage() {
     sed -n '2,/^# ===/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
+export HF_LB_REVISION="513b8d9857fe13dde2af2c73f90dc0a0b063405b"
+export HF_LAW_REVISION="690800ee6c49f0bfde6c1e26f64031601feba6ae" # 10000 corpus rows
+
+
 # ── Args ───────────────────────────────────────────────────────────
-COMPONENTS="all"
+COMPONENTS="legalbench"
 DATA_ROOT="tmp/data"
 LEGALBENCH_DIR="${DATA_ROOT}/legalbench_artifacts"
 FORCE=0

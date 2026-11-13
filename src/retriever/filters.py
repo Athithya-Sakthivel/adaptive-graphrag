@@ -1,4 +1,9 @@
-"""Immutable, backward-compatible metadata filters."""
+"""Immutable, backward-compatible metadata filters.
+
+Applied inside the SQL WHERE clause of every retrieval arm to preserve
+recall under restrictive predicates (post-filtering destroys recall
+because HNSW scans a fixed number of candidates before filtering).
+"""
 
 from __future__ import annotations
 
@@ -9,14 +14,22 @@ from datetime import date, datetime
 
 @dataclass(frozen=True, slots=True, init=False)
 class Filters:
+    """Immutable metadata filters for retrieval queries.
+
+    Args:
+        court: Court slug (e.g., "ca9", "scotus").
+        jurisdiction: Jurisdiction code (e.g., "us", "us-ca9").
+        published_only: Restrict to published opinions.
+        date_from: Inclusive start date.
+        date_to: Inclusive end date.
+        case_ids: Restrict to specific case IDs.
+    """
+
     court: str | None
     jurisdiction: str | None
     published_only: bool
     date_from: date | None
     date_to: date | None
-
-    # Internal immutable representation. The public case_ids property
-    # returns a defensive list copy to preserve the documented API.
     _case_ids: tuple[int, ...] | None
 
     def __init__(
@@ -32,20 +45,17 @@ class Filters:
             if value is None:
                 return None
             if not isinstance(value, str):
-                raise TypeError(f"{name} must be string or None")
+                raise TypeError(f"{name} must be str or None")
             return value.strip() or None
 
-        def normalize_date(
-            value: date | datetime | None,
-            name: str,
-        ) -> date | None:
+        def normalize_date(value: date | datetime | None, name: str) -> date | None:
             if value is None:
                 return None
             if isinstance(value, datetime):
                 return value.date()
             if isinstance(value, date):
                 return value
-            raise TypeError(f"{name} must be date, datetime or None")
+            raise TypeError(f"{name} must be date, datetime, or None")
 
         court = normalize_text(court, "court")
         jurisdiction = normalize_text(jurisdiction, "jurisdiction")
@@ -56,31 +66,23 @@ class Filters:
         date_from = normalize_date(date_from, "date_from")
         date_to = normalize_date(date_to, "date_to")
 
-        if date_from is not None and date_to is not None:
-            if date_from > date_to:
-                raise ValueError("date_from cannot exceed date_to")
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise ValueError("date_from cannot exceed date_to")
 
         normalized_ids: tuple[int, ...] | None
-
         if case_ids is None:
             normalized_ids = None
         else:
             if isinstance(case_ids, (str, bytes)):
-                raise TypeError("case_ids must contain integer IDs")
-
+                raise TypeError("case_ids must contain int IDs")
             seen: set[int] = set()
             values: list[int] = []
-
             for case_id in case_ids:
-                if isinstance(case_id, bool) or not isinstance(case_id, int):
-                    raise TypeError(f"case ID must be integer: {case_id!r}")
-                if case_id <= 0:
-                    raise ValueError("case IDs must be positive")
-
+                if isinstance(case_id, bool) or not isinstance(case_id, int) or case_id <= 0:
+                    raise ValueError(f"case ID must be positive int: {case_id!r}")
                 if case_id not in seen:
                     seen.add(case_id)
                     values.append(case_id)
-
             normalized_ids = tuple(values)
 
         for name, value in (
@@ -95,18 +97,17 @@ class Filters:
 
     @property
     def case_ids(self) -> list[int] | None:
-        """Return a defensive copy, preserving the documented list API."""
-
-        if self._case_ids is None:
-            return None
-        return list(self._case_ids)
+        """Defensive copy preserving documented list API."""
+        return list(self._case_ids) if self._case_ids is not None else None
 
     @property
     def matches_nothing(self) -> bool:
+        """True if filters restrict to an empty result set."""
         return self._case_ids == ()
 
     @property
     def has_restrictions(self) -> bool:
+        """True if any filter predicate is active."""
         return any(
             (
                 self.court is not None,
@@ -119,24 +120,22 @@ class Filters:
         )
 
     def sql_params(self) -> dict:
+        """Return dict suitable for psycopg parameter binding."""
         return {
             "court": self.court,
             "jurisdiction": self.jurisdiction,
             "published_only": self.published_only,
             "date_from": self.date_from,
             "date_to": self.date_to,
-            "case_ids": (list(self._case_ids) if self._case_ids is not None else None),
+            "case_ids": list(self._case_ids) if self._case_ids is not None else None,
         }
 
     def with_case_ids(self, case_ids: Iterable[int]) -> Filters:
-        """Intersect additional case candidates with existing restrictions."""
-
+        """Return new Filters intersecting case_ids with existing restrictions."""
         candidates = tuple(case_ids)
-
         if self._case_ids is not None:
             allowed = set(self._case_ids)
-            candidates = tuple(case_id for case_id in candidates if case_id in allowed)
-
+            candidates = tuple(cid for cid in candidates if cid in allowed)
         return Filters(
             court=self.court,
             jurisdiction=self.jurisdiction,

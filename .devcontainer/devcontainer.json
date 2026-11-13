@@ -1,5 +1,5 @@
 {
-  "name": "adaptive-graphrag",
+  "name": "scalable-rag",
   "build": {
     "dockerfile": "Dockerfile",
     "context": "."

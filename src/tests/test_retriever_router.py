@@ -3,8 +3,10 @@
 These tests mock dense, sparse, exact, and graph retrieval. They test
 routing decisions and orchestration, not SQL execution.
 
-Run from /workspace/src:
+Parent expansion lives in exact.case_ids_to_hits (not graph), so
+install_parent_expansion patches router.exact.
 
+Run from /workspace/src:
     pytest tests/test_retriever_router.py -v
 """
 
@@ -20,14 +22,15 @@ from retriever.classify import QueryClass
 from retriever.filters import Filters
 from retriever.fusion import Hit
 
+EMBEDDING_DIMENSIONS = 384
+
+
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
 
 
 class FakeTokenizer:
-    """Small tokenizer substitute for router-side query-length validation."""
-
     def encode(self, text: str, **kwargs: Any) -> list[int]:
         return list(range(max(1, len(text.split()))))
 
@@ -37,14 +40,12 @@ class FakeEmbedder:
 
     def __init__(self) -> None:
         self.tokenizer = FakeTokenizer()
-        # Match QueryEmbedder's default 128-token limit so length
-        # guards are tested realistically.
         self.max_seq_length = 128
         self.calls: list[str] = []
 
     def embed_query(self, query: str) -> np.ndarray:
         self.calls.append(query)
-        return np.ones(1024, dtype=np.float32)
+        return np.ones(EMBEDDING_DIMENSIONS, dtype=np.float32)
 
 
 @pytest.fixture
@@ -64,8 +65,6 @@ def make_hit(
     is_parent: bool = False,
     score: float = 0.0,
 ) -> Hit:
-    """Create a valid Hit with the fields required by fusion and the CLI."""
-
     return Hit(
         chunk_id=chunk_id,
         case_id=case_id,
@@ -86,7 +85,6 @@ def install_case_resolution(
     case_ids: list[int],
 ) -> None:
     """Stub exact case-name resolution without touching the database."""
-
     monkeypatch.setattr(
         router.exact,
         "resolve_case_ids",
@@ -95,7 +93,11 @@ def install_case_resolution(
 
 
 def install_parent_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Return one deterministic parent Hit for each requested case ID."""
+    """Return one deterministic parent Hit per requested case ID.
+
+    Patches exact.case_ids_to_hits — the router's _expand_parents helper
+    calls it there, not on the graph module.
+    """
 
     def fake_case_ids_to_hits(
         conn: Any,
@@ -103,19 +105,19 @@ def install_parent_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
         *args: Any,
         **kwargs: Any,
     ) -> list[Hit]:
-        return [
-            make_hit(
-                chunk_id=f"parent-{case_id}",
-                case_id=case_id,
-                is_parent=True,
-            )
-            for case_id in case_ids
-        ]
+        return [make_hit(f"parent-{case_id}", case_id, is_parent=True) for case_id in case_ids]
 
+    monkeypatch.setattr(router.exact, "case_ids_to_hits", fake_case_ids_to_hits)
+
+
+def install_opinion_id_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    case_ids: list[int],
+) -> None:
     monkeypatch.setattr(
-        router.graph,
-        "case_ids_to_hits",
-        fake_case_ids_to_hits,
+        router.exact,
+        "resolve_opinion_id",
+        lambda *args, **kwargs: list(case_ids),
     )
 
 
@@ -128,8 +130,6 @@ def test_holding_uses_dense_and_sparse_without_graph(
     monkeypatch: pytest.MonkeyPatch,
     embedder: FakeEmbedder,
 ) -> None:
-    """HOLDING uses dense + sparse fusion and does not traverse the graph."""
-
     calls: list[str] = []
 
     def fake_dense(*args: Any, **kwargs: Any) -> list[Hit]:
@@ -147,18 +147,76 @@ def test_holding_uses_dense_and_sparse_without_graph(
     monkeypatch.setattr(router.sparse, "search", fake_sparse)
     monkeypatch.setattr(router.graph, "search", forbidden_graph)
 
-    result = router.route(
-        None,
-        embedder,
-        "what did the court hold on qualified immunity",
-    )
+    result = router.route(None, embedder, "what did the court hold on qualified immunity")
 
     assert result.query_class is QueryClass.HOLDING
     assert "dense" in calls
     assert "sparse" in calls
-    assert "graph" not in calls
+    assert "graph_1hop" not in result.arms_used
     assert embedder.calls == ["what did the court hold on qualified immunity"]
     assert result.hits
+
+
+def test_holding_survives_dense_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: FakeEmbedder,
+) -> None:
+    """A failing dense arm must degrade to sparse, not abort the query."""
+
+    def broken_dense(*args: Any, **kwargs: Any) -> list[Hit]:
+        raise RuntimeError("index unavailable")
+
+    monkeypatch.setattr(router.dense, "search", broken_dense)
+    monkeypatch.setattr(
+        router.sparse,
+        "search",
+        lambda *args, **kwargs: [make_hit("sparse-1", case_id=2)],
+    )
+
+    result = router.route(None, embedder, "what did the court hold on qualified immunity")
+
+    assert result.hits
+    dense_diag = next(d for d in result.arm_diagnostics if d.name == "dense")
+    assert dense_diag.error is not None
+    assert dense_diag.hits == 0
+
+
+def test_citation_precedes_holding_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rule 2 (citation) fires before rule 4 (holding keyword).
+
+    'what did 410 U.S. 113 hold' resolves to LOOKUP, not HOLDING.
+    Documented limitation: citation presence wins over holding intent.
+    """
+    install_parent_expansion(monkeypatch)
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [make_hit("s", 2)])
+    monkeypatch.setattr(router.exact, "search", lambda *a, **k: [make_hit("e", 3, is_parent=True)])
+    monkeypatch.setattr(router.graph, "search", lambda *a, **k: [])
+
+    result = router.route(None, None, "what did 410 U.S. 113 hold")
+
+    assert result.query_class is QueryClass.LOOKUP
+    assert "exact" in result.arms_used
+
+
+def test_holding_skips_exact_arm_without_citation(
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: FakeEmbedder,
+) -> None:
+    """HOLDING with a case name but no reporter citation runs dense+sparse only."""
+    monkeypatch.setattr(router.dense, "search", lambda *a, **k: [make_hit("d", 1)])
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [make_hit("s", 2)])
+
+    def forbidden_exact(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("HOLDING without a citation must not run the exact arm")
+
+    monkeypatch.setattr(router.exact, "search", forbidden_exact)
+
+    result = router.route(None, embedder, "what did the court hold in Roe v. Wade")
+
+    assert result.query_class is QueryClass.HOLDING
+    assert "exact" not in result.arms_used
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +227,6 @@ def test_holding_uses_dense_and_sparse_without_graph(
 def test_lookup_resolves_target_and_uses_incoming_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LOOKUP finds cases citing the resolved target using incoming edges."""
-
     calls: list[tuple[str, Any]] = []
 
     install_case_resolution(monkeypatch, [10])
@@ -189,26 +245,14 @@ def test_lookup_resolves_target_and_uses_incoming_graph(
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         calls.append(
-            (
-                "graph",
-                {
-                    "seed_case_ids": seed_case_ids,
-                    "direction": direction,
-                    "depth": depth,
-                },
-            )
+            ("graph", {"seed_case_ids": seed_case_ids, "direction": direction, "depth": depth})
         )
-        return [{"case_id": 20, "hop": 1, "score": 0.0}]
+        return [{"case_id": 20, "hop": 1}]
 
     monkeypatch.setattr(router.sparse, "search", fake_sparse)
     monkeypatch.setattr(router.graph, "search", fake_graph)
 
-    # LOOKUP must not need an embedding model.
-    result = router.route(
-        None,
-        None,
-        "which cases cite Roe v. Wade",
-    )
+    result = router.route(None, None, "which cases cite Roe v. Wade")
 
     assert result.query_class is QueryClass.LOOKUP
 
@@ -223,13 +267,58 @@ def test_lookup_resolves_target_and_uses_incoming_graph(
     assert result.hits
 
 
+def test_lookup_never_loads_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LOOKUP is a structural query; no embedding model may be touched."""
+    embedder = FakeEmbedder()
+
+    install_case_resolution(monkeypatch, [10])
+    install_parent_expansion(monkeypatch)
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [])
+    monkeypatch.setattr(router.graph, "search", lambda *a, **k: [{"case_id": 20, "hop": 1}])
+
+    router.route(None, embedder, "which cases cite Roe v. Wade")
+
+    assert embedder.calls == []
+
+
+def test_lookup_capitalized_template_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gold-set template 'Which cases cite X?' must resolve X."""
+    install_case_resolution(monkeypatch, [10])
+    install_parent_expansion(monkeypatch)
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [])
+    monkeypatch.setattr(router.graph, "search", lambda *a, **k: [{"case_id": 20, "hop": 1}])
+
+    result = router.route(None, None, "Which cases cite Delevie v. State?")
+
+    assert "graph_1hop" in result.arms_used
+    resolution = next(d for d in result.arm_diagnostics if d.name == "case_name_resolution")
+    assert resolution.hits == 1
+
+
+def test_lookup_uses_explicit_opinion_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_opinion_id_resolution(monkeypatch, [10])
+    install_parent_expansion(monkeypatch)
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [])
+    monkeypatch.setattr(router.graph, "search", lambda *a, **k: [{"case_id": 20, "hop": 1}])
+
+    def forbidden_name_resolution(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Explicit opinion ID must bypass case-name resolution")
+
+    monkeypatch.setattr(router.exact, "resolve_case_ids", forbidden_name_resolution)
+
+    result = router.route(None, None, "Find cases citing opinion 123456")
+
+    assert result.query_class is QueryClass.LOOKUP
+    assert "graph_1hop" in result.arms_used
+    assert any(d.name == "opinion_id_resolution" for d in result.arm_diagnostics)
+
+
 def test_lookup_skips_graph_when_target_cannot_be_resolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unresolved case name must not create arbitrary graph seeds."""
-
     install_case_resolution(monkeypatch, [])
-
     monkeypatch.setattr(
         router.sparse,
         "search",
@@ -237,18 +326,28 @@ def test_lookup_skips_graph_when_target_cannot_be_resolved(
     )
 
     def forbidden_graph(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Graph traversal must be skipped when the target case is unresolved")
+        raise AssertionError("Graph traversal must be skipped when the target is unresolved")
 
     monkeypatch.setattr(router.graph, "search", forbidden_graph)
 
-    result = router.route(
-        None,
-        None,
-        "which cases cite Unknown v. Unknown",
-    )
+    result = router.route(None, None, "which cases cite Unknown v. Unknown")
 
     assert result.query_class is QueryClass.LOOKUP
     assert "graph_1hop" not in result.arms_used
+    assert result.hits
+
+
+def test_lookup_graph_hits_carry_hop_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_case_resolution(monkeypatch, [10])
+    install_parent_expansion(monkeypatch)
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [])
+    monkeypatch.setattr(router.graph, "search", lambda *a, **k: [{"case_id": 20, "hop": 1}])
+
+    result = router.route(None, None, "which cases cite Roe v. Wade", top_k=10)
+
+    graph_hit = next(h for h in result.hits if h.case_id == 20)
+    assert graph_hit.meta["hop"] == 1
+    assert graph_hit.meta["graph_direction"] == "incoming"
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +359,6 @@ def test_validity_searches_incoming_citers_then_filters_dense_search(
     monkeypatch: pytest.MonkeyPatch,
     embedder: FakeEmbedder,
 ) -> None:
-    """VALIDITY searches citers, then constrains dense retrieval to those cases."""
-
     install_case_resolution(monkeypatch, [10])
     install_parent_expansion(monkeypatch)
 
@@ -282,14 +379,8 @@ def test_validity_searches_incoming_citers_then_filters_dense_search(
         depth: int = 1,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
-        graph_calls.append(
-            {
-                "seed_case_ids": seed_case_ids,
-                "direction": direction,
-                "depth": depth,
-            }
-        )
-        return [{"case_id": 20, "hop": 1, "score": 0.0}]
+        graph_calls.append({"seed_case_ids": seed_case_ids, "direction": direction, "depth": depth})
+        return [{"case_id": 20, "hop": 1}]
 
     def fake_dense(
         conn: Any,
@@ -304,11 +395,7 @@ def test_validity_searches_incoming_citers_then_filters_dense_search(
     monkeypatch.setattr(router.graph, "search", fake_graph)
     monkeypatch.setattr(router.dense, "search", fake_dense)
 
-    result = router.route(
-        None,
-        embedder,
-        "has Roe v. Wade been overruled",
-    )
+    result = router.route(None, embedder, "has Roe v. Wade been overruled")
 
     assert result.query_class is QueryClass.VALIDITY
 
@@ -330,192 +417,32 @@ def test_validity_does_not_run_dense_when_graph_finds_no_citers(
     monkeypatch: pytest.MonkeyPatch,
     embedder: FakeEmbedder,
 ) -> None:
-    """No citing cases means no pointless dense search over an empty set."""
-
     install_case_resolution(monkeypatch, [10])
+    install_parent_expansion(monkeypatch)
 
     monkeypatch.setattr(
         router.sparse,
         "search",
         lambda *args, **kwargs: [make_hit("sparse-target", case_id=10)],
     )
-    monkeypatch.setattr(
-        router.graph,
-        "search",
-        lambda *args, **kwargs: [],
-    )
+    monkeypatch.setattr(router.graph, "search", lambda *args, **kwargs: [])
 
     def forbidden_dense(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Dense citers search must be skipped when the graph has no citers")
+        raise AssertionError("Dense citers search must be skipped when there are no citers")
 
     monkeypatch.setattr(router.dense, "search", forbidden_dense)
 
-    result = router.route(
-        None,
-        embedder,
-        "has Roe v. Wade been overruled",
-    )
+    result = router.route(None, embedder, "has Roe v. Wade been overruled")
 
     assert result.query_class is QueryClass.VALIDITY
-    # embed_query may be called for the doc, but dense.search must not be.
-    assert all("citers" not in c for c in embedder.calls)
+    assert "dense_citers" not in result.arms_used
 
 
-# ---------------------------------------------------------------------------
-# APPLICATION (case reference)
-# ---------------------------------------------------------------------------
-
-
-def test_application_uses_incoming_graph_and_two_pass_fusion(
+def test_validity_falls_back_when_target_unresolved(
     monkeypatch: pytest.MonkeyPatch,
     embedder: FakeEmbedder,
 ) -> None:
-    """APPLICATION resolves the target case and traverses incoming edges.
-
-    Audit fix: pre-hardening APPLICATION used direction="outgoing" and
-    seeded from pass1 dense+sparse. Hardened code resolves the named
-    case first and uses direction="incoming" — "how has X been applied"
-    asks for cases CITING X, not cases X cites.
-    """
-    graph_calls: list[dict[str, Any]] = []
-    pass2_calls: list[tuple[list[Hit], list[Hit]]] = []
-
-    # "Roe v. Wade" resolves to case_id 10 via stubbed exact.resolve_case_ids
-    install_case_resolution(monkeypatch, [10])
-    install_parent_expansion(monkeypatch)
-
-    # Dense/sparse return hits for case_id 1 (unrelated to the target).
-    # These are KEPT in pass1 (case 1 is not the resolved target).
-    monkeypatch.setattr(
-        router.dense,
-        "search",
-        lambda *args, **kwargs: [make_hit("dense-seed", case_id=1)],
-    )
-    monkeypatch.setattr(
-        router.sparse,
-        "search",
-        lambda *args, **kwargs: [make_hit("sparse-seed", case_id=1)],
-    )
-
-    def fake_graph(
-        conn: Any,
-        seed_case_ids: list[int],
-        *,
-        direction: str = "incoming",
-        depth: int = 1,
-        **kwargs: Any,
-    ) -> list[dict[str, Any]]:
-        graph_calls.append(
-            {
-                "seed_case_ids": seed_case_ids,
-                "direction": direction,
-                "depth": depth,
-            }
-        )
-        return [{"case_id": 20, "hop": 1, "score": 0.0}]
-
-    monkeypatch.setattr(router.graph, "search", fake_graph)
-
-    def fake_pass2(
-        seeds: list[Hit],
-        graph_hits: list[Hit],
-        **kwargs: Any,
-    ) -> list[Hit]:
-        pass2_calls.append((seeds, graph_hits))
-        return [make_hit("final-result", case_id=20, is_parent=True)]
-
-    monkeypatch.setattr(router, "rrf_pass2", fake_pass2)
-
-    result = router.route(
-        None,
-        embedder,
-        "how has Roe v. Wade been applied",
-    )
-
-    assert result.query_class is QueryClass.APPLICATION
-
-    # Graph called with the RESOLVED seed, incoming direction.
-    assert len(graph_calls) == 1
-    assert graph_calls[0]["seed_case_ids"] == [10]
-    assert graph_calls[0]["direction"] == "incoming"
-    assert graph_calls[0]["depth"] == 1
-
-    # Pass 2 fused seeds with graph hits.
-    assert len(pass2_calls) == 1
-    seeds_at_pass2, graph_at_pass2 = pass2_calls[0]
-    # Target case (10) must not appear in seeds passed to pass2.
-    assert all(h.case_id != 10 for h in seeds_at_pass2)
-    # Graph hits fed to pass2.
-    assert len(graph_at_pass2) == 1
-    assert graph_at_pass2[0].case_id == 20
-
-    assert result.hits[0].chunk_id == "final-result"
-
-
-def test_application_falls_back_to_pass1_when_graph_returns_no_citers(
-    monkeypatch: pytest.MonkeyPatch,
-    embedder: FakeEmbedder,
-) -> None:
-    """An empty graph result must not discard the dense/sparse pass1."""
-
-    install_case_resolution(monkeypatch, [10])
-
-    monkeypatch.setattr(
-        router.dense,
-        "search",
-        lambda *args, **kwargs: [make_hit("dense-seed", case_id=1)],
-    )
-    monkeypatch.setattr(
-        router.sparse,
-        "search",
-        lambda *args, **kwargs: [make_hit("sparse-seed", case_id=1)],
-    )
-    monkeypatch.setattr(
-        router.graph,
-        "search",
-        lambda *args, **kwargs: [],  # target has 0 citers
-    )
-
-    def forbidden_pass2(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Pass 2 must be skipped when graph retrieval returns no hits")
-
-    monkeypatch.setattr(router, "rrf_pass2", forbidden_pass2)
-
-    result = router.route(
-        None,
-        embedder,
-        "how has Roe v. Wade been applied",
-    )
-
-    assert result.query_class is QueryClass.APPLICATION
-    assert result.hits  # pass1 preserved
-    assert "dense" in result.arms_used
-    assert "sparse" in result.arms_used
-    # Graph was attempted (recorded in arms_used) but contributed 0 hits.
-    assert "graph_1hop" in result.arms_used
-
-
-# ---------------------------------------------------------------------------
-# APPLICATION (doctrine-only, no case reference)
-# ---------------------------------------------------------------------------
-
-
-def test_doctrine_application_skips_graph(
-    monkeypatch: pytest.MonkeyPatch,
-    embedder: FakeEmbedder,
-) -> None:
-    """Doctrine-only APPLICATION (no case ref) routes to dense+sparse only.
-
-    "how has qualified immunity been applied" resolves to APPLICATION
-    (via classify rule 5) but has no case reference to seed graph
-    traversal. The router must skip the graph arm entirely — no seed
-    means no graph.
-    """
-    monkeypatch.setattr(
-        router.dense,
-        "search",
-        lambda *args, **kwargs: [make_hit("dense-1", case_id=1)],
-    )
+    install_case_resolution(monkeypatch, [])
     monkeypatch.setattr(
         router.sparse,
         "search",
@@ -523,39 +450,78 @@ def test_doctrine_application_skips_graph(
     )
 
     def forbidden_graph(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Doctrine APPLICATION (no case ref) must not attempt graph")
+        raise AssertionError("Graph must be skipped when the target is unresolved")
 
     monkeypatch.setattr(router.graph, "search", forbidden_graph)
 
-    def forbidden_pass2(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Doctrine APPLICATION must not use pass2 fusion")
+    result = router.route(None, embedder, "has Unknown v. Unknown been overruled")
 
-    monkeypatch.setattr(router, "rrf_pass2", forbidden_pass2)
-
-    result = router.route(
-        None,
-        embedder,
-        "how has qualified immunity been applied",
-    )
-
-    assert result.query_class is QueryClass.APPLICATION
-    assert result.hits
-    assert "dense" in result.arms_used
-    assert "sparse" in result.arms_used
+    assert result.query_class is QueryClass.VALIDITY
     assert "graph_1hop" not in result.arms_used
-    assert "graph_2hop" not in result.arms_used
+    assert result.hits
+
+
+def test_validity_survives_dense_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: FakeEmbedder,
+) -> None:
+    install_case_resolution(monkeypatch, [10])
+    install_parent_expansion(monkeypatch)
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [])
+    monkeypatch.setattr(router.graph, "search", lambda *a, **k: [{"case_id": 20, "hop": 1}])
+
+    def broken_dense(*args: Any, **kwargs: Any) -> list[Hit]:
+        raise RuntimeError("index unavailable")
+
+    monkeypatch.setattr(router.dense, "search", broken_dense)
+
+    result = router.route(None, embedder, "has Roe v. Wade been overruled")
+
+    assert result.hits
+    dense_diag = next(d for d in result.arm_diagnostics if d.name == "dense_citers")
+    assert dense_diag.error is not None
 
 
 # ---------------------------------------------------------------------------
-# Shared validation and filter behavior
+# Shared validation, diagnostics, and filter behavior
 # ---------------------------------------------------------------------------
+
+
+def test_every_attempted_arm_has_a_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: FakeEmbedder,
+) -> None:
+    monkeypatch.setattr(router.dense, "search", lambda *a, **k: [make_hit("d", 1)])
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [make_hit("s", 2)])
+
+    result = router.route(None, embedder, "what did the court hold on qualified immunity")
+
+    names = {d.name for d in result.arm_diagnostics}
+    assert {"dense", "sparse"} <= names
+    assert all(d.latency_ms >= 0 for d in result.arm_diagnostics)
+
+
+def test_case_diversity_collapses_repeated_cases(
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: FakeEmbedder,
+) -> None:
+    """HOLDING allows one chunk per case, so repeats must collapse."""
+    monkeypatch.setattr(
+        router.dense,
+        "search",
+        lambda *a, **k: [make_hit("c1", 7), make_hit("c2", 7), make_hit("c3", 8)],
+    )
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [])
+
+    result = router.route(None, embedder, "what did the court hold on qualified immunity")
+
+    case_ids = [h.case_id for h in result.hits]
+    assert len(case_ids) == len(set(case_ids))
 
 
 def test_empty_case_id_filter_returns_no_results_without_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An explicit empty case-ID filter means no eligible cases."""
-
     embedder = FakeEmbedder()
 
     def forbidden_search(*args: Any, **kwargs: Any) -> None:
@@ -574,16 +540,43 @@ def test_empty_case_id_filter_returns_no_results_without_search(
     )
 
     assert result.hits == []
+    assert result.arms_used == []
     assert embedder.calls == []
 
 
 @pytest.mark.parametrize("query", ["", "   ", "\n\t"])
 def test_blank_query_raises_value_error(query: str) -> None:
-    """Blank input must fail before classification or retrieval."""
-
     with pytest.raises(ValueError, match="query"):
-        router.route(
-            None,
-            FakeEmbedder(),
-            query,
-        )
+        router.route(None, FakeEmbedder(), query)
+
+
+@pytest.mark.parametrize("top_k", [0, -1])
+def test_invalid_top_k_raises(top_k: int) -> None:
+    with pytest.raises(ValueError, match="top_k"):
+        router.route(None, FakeEmbedder(), "what did the court hold", top_k=top_k)
+
+
+def test_non_string_query_rejected() -> None:
+    with pytest.raises(TypeError):
+        router.route(None, FakeEmbedder(), None)  # type: ignore[arg-type]
+
+
+def test_invalid_filters_type_rejected() -> None:
+    with pytest.raises(TypeError):
+        router.route(None, FakeEmbedder(), "what did the court hold", filters="court=ca9")  # type: ignore[arg-type]
+
+
+def test_top_k_limits_returned_hits(
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: FakeEmbedder,
+) -> None:
+    monkeypatch.setattr(
+        router.dense,
+        "search",
+        lambda *a, **k: [make_hit(f"c{i}", i + 1) for i in range(30)],
+    )
+    monkeypatch.setattr(router.sparse, "search", lambda *a, **k: [])
+
+    result = router.route(None, embedder, "what did the court hold on qualified immunity", top_k=5)
+
+    assert len(result.hits) == 5

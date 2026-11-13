@@ -1,265 +1,200 @@
 """Deterministic metrics for legal retrieval evaluation.
 
-PEP 695 type aliases (``type Span = ...``) are used throughout; this
-requires Python 3.12+.
+Provides standard IR metrics (Recall, NDCG, MRR), bootstrap confidence
+intervals for statistical rigor, and failure mode categorization to
+diagnose exactly why queries fail.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite, log2
 from typing import Any
 
-type Span = tuple[str, int, int]
+import numpy as np
 
 
 @dataclass(frozen=True, slots=True)
 class Prediction:
+    """Normalized retrieval result for metric computation."""
+
     id: str
     retrieved_case_ids: list[int]
     retrieved_chunk_ids: list[str]
-    retrieved_spans: list[Span]
     query_class_actual: str | None
     arms_used: list[str]
-    arm_diagnostics: list[dict[str, Any]]
     latency_ms: float
     empty: bool
     answerable: bool
+
+
+class FailureMode(Enum):
+    SUCCESS = "success"
+    CLASSIFICATION_ERROR = "classification"
+    RESOLUTION_ERROR = "resolution"
+    RETRIEVAL_ERROR = "retrieval"
+    RANKING_ERROR = "ranking"
+    EMPTY_RESULTS = "empty"
+    FALSE_POSITIVE = "false_positive"
+
+
+def analyze_failure(
+    prediction: Prediction,
+    gold_case_ids: Sequence[int],
+    gold_query_class: str,
+    top_k: int = 10,
+) -> FailureMode:
+    """Categorize the outcome of one query.
+
+    Negative controls (empty gold) succeed when the system returns
+    nothing, and fail as FALSE_POSITIVE when it returns anything.
+
+    Resolution failure is inferred from arms_used: the router only
+    appends graph_1hop when the target case resolved, so its absence
+    on a LOOKUP/VALIDITY query means resolution failed.
+    """
+    gold_set = set(gold_case_ids)
+
+    if not gold_set:
+        return FailureMode.SUCCESS if prediction.empty else FailureMode.FALSE_POSITIVE
+
+    if prediction.query_class_actual != gold_query_class:
+        return FailureMode.CLASSIFICATION_ERROR
+
+    if gold_query_class in ("LOOKUP", "VALIDITY") and "graph_1hop" not in prediction.arms_used:
+        return FailureMode.RESOLUTION_ERROR
+
+    if prediction.empty:
+        return FailureMode.EMPTY_RESULTS
+
+    if not (gold_set & set(prediction.retrieved_case_ids)):
+        return FailureMode.RETRIEVAL_ERROR
+
+    if not (gold_set & set(prediction.retrieved_case_ids[:top_k])):
+        return FailureMode.RANKING_ERROR
+
+    return FailureMode.SUCCESS
+
+
+def bootstrap_ci(
+    values: Sequence[float],
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+) -> tuple[float, float, float]:
+    """Compute mean and bootstrap confidence interval.
+
+    Returns:
+        (mean, lower_bound, upper_bound)
+    """
+    if not values:
+        return 0.0, 0.0, 0.0
+
+    arr = np.asarray(values, dtype=np.float64)
+    rng = np.random.default_rng(seed=42)
+    samples = rng.choice(arr, size=(n_bootstrap, len(arr)), replace=True)
+    means = samples.mean(axis=1)
+
+    lower_pct = (1.0 - confidence) / 2.0 * 100.0
+    upper_pct = (1.0 + confidence) / 2.0 * 100.0
+
+    return (
+        float(np.mean(arr)),
+        float(np.percentile(means, lower_pct)),
+        float(np.percentile(means, upper_pct)),
+    )
+
+
+def _validate_k(k: int) -> None:
+    if not isinstance(k, int) or k < 1:
+        raise ValueError(f"k must be positive int, got {k!r}")
 
 
 def _unique(values: Sequence[Any]) -> list[Any]:
     return list(dict.fromkeys(values))
 
 
-def _validate_k(k: int) -> None:
-    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-        raise ValueError("k must be a positive integer")
-
-
-def case_recall_at_k(
-    gold_case_ids: Sequence[int],
-    retrieved_case_ids: Sequence[int],
+def recall_at_k(
+    gold_ids: Sequence[int],
+    retrieved_ids: Sequence[int],
     k: int,
 ) -> float:
     _validate_k(k)
-    gold = set(gold_case_ids)
+    gold = set(gold_ids)
     if not gold:
         return 0.0
-    retrieved = set(_unique(retrieved_case_ids)[:k])
+    retrieved = set(_unique(retrieved_ids)[:k])
     return len(gold & retrieved) / len(gold)
 
 
-def chunk_recall_at_k(
-    gold_chunk_ids: Sequence[str],
-    retrieved_chunk_ids: Sequence[str],
+def ndcg_at_k(
+    gold_ids: Sequence[int],
+    retrieved_ids: Sequence[int],
     k: int,
 ) -> float:
     _validate_k(k)
-    gold = set(gold_chunk_ids)
+    gold = set(gold_ids)
     if not gold:
         return 0.0
-    retrieved = set(_unique(retrieved_chunk_ids)[:k])
-    return len(gold & retrieved) / len(gold)
 
-
-def case_ndcg_at_k(
-    gold_case_ids: Sequence[int],
-    retrieved_case_ids: Sequence[int],
-    k: int,
-) -> float:
-    _validate_k(k)
-    gold = set(gold_case_ids)
-    if not gold:
-        return 0.0
-    retrieved = _unique(retrieved_case_ids)[:k]
+    retrieved = _unique(retrieved_ids)[:k]
     dcg = sum(
         1.0 / log2(rank + 1) for rank, case_id in enumerate(retrieved, start=1) if case_id in gold
     )
+
     ideal_count = min(len(gold), k)
     idcg = sum(1.0 / log2(rank + 1) for rank in range(1, ideal_count + 1))
+
     return dcg / idcg if idcg else 0.0
 
 
-def mrr(
-    gold_case_ids: Sequence[int],
-    retrieved_case_ids: Sequence[int],
-) -> float:
-    gold = set(gold_case_ids)
+def mrr(gold_ids: Sequence[int], retrieved_ids: Sequence[int]) -> float:
+    gold = set(gold_ids)
     if not gold:
         return 0.0
-    for rank, case_id in enumerate(_unique(retrieved_case_ids), start=1):
+    for rank, case_id in enumerate(_unique(retrieved_ids), start=1):
         if case_id in gold:
             return 1.0 / rank
     return 0.0
 
 
-def _coerce_span(value: Any) -> Span:
-    if isinstance(value, Mapping):
-        doc = value.get("doc", value.get("file_path"))
-        start = value.get("start")
-        end = value.get("end")
-        if start is None or end is None:
-            raw = value.get("span")
-            if isinstance(raw, (list, tuple)) and len(raw) == 2:
-                start, end = raw
-    elif isinstance(value, (list, tuple)) and len(value) == 3:
-        doc, start, end = value
-    else:
-        raise ValueError(f"Invalid span: {value!r}")
-
-    if not isinstance(doc, str) or not doc:
-        raise ValueError("Span document must be a non-empty string")
-
-    if (
-        isinstance(start, bool)
-        or isinstance(end, bool)
-        or not isinstance(start, int)
-        or not isinstance(end, int)
-        or start < 0
-        or end <= start
-    ):
-        raise ValueError(f"Invalid half-open interval: {value!r}")
-
-    return doc, start, end
-
-
-def _merge_intervals(
-    spans: Sequence[Any],
-) -> dict[str, list[tuple[int, int]]]:
-    grouped: dict[str, list[tuple[int, int]]] = {}
-    for raw in spans:
-        doc, start, end = _coerce_span(raw)
-        grouped.setdefault(doc, []).append((start, end))
-
-    merged: dict[str, list[tuple[int, int]]] = {}
-    for doc, intervals in grouped.items():
-        intervals.sort()
-        output: list[tuple[int, int]] = []
-        for start, end in intervals:
-            if output and start <= output[-1][1]:
-                old_start, old_end = output[-1]
-                output[-1] = (old_start, max(old_end, end))
-            else:
-                output.append((start, end))
-        merged[doc] = output
-    return merged
-
-
-def _total_length(
-    intervals: Mapping[str, Sequence[tuple[int, int]]],
-) -> int:
-    return sum(end - start for values in intervals.values() for start, end in values)
-
-
-def _intersection_length(
-    left: Mapping[str, Sequence[tuple[int, int]]],
-    right: Mapping[str, Sequence[tuple[int, int]]],
-) -> int:
-    total = 0
-    for doc in left.keys() & right.keys():
-        a = left[doc]
-        b = right[doc]
-        i = 0
-        j = 0
-        while i < len(a) and j < len(b):
-            start = max(a[i][0], b[j][0])
-            end = min(a[i][1], b[j][1])
-            if end > start:
-                total += end - start
-            if a[i][1] <= b[j][1]:
-                i += 1
-            else:
-                j += 1
-    return total
-
-
-def char_span_recall(
-    gold_spans: Sequence[Any],
-    retrieved_spans: Sequence[Any],
-) -> float:
-    gold = _merge_intervals(gold_spans)
-    denominator = _total_length(gold)
-    if denominator == 0:
+def empty_result_rate(predictions: Sequence[Prediction]) -> float:
+    if not predictions:
         return 0.0
-    retrieved = _merge_intervals(retrieved_spans)
-    return _intersection_length(gold, retrieved) / denominator
+    return sum(p.empty for p in predictions) / len(predictions)
 
 
-def char_span_precision(
-    gold_spans: Sequence[Any],
-    retrieved_spans: Sequence[Any],
-) -> float:
-    retrieved = _merge_intervals(retrieved_spans)
-    denominator = _total_length(retrieved)
-    if denominator == 0:
-        return 0.0
-    gold = _merge_intervals(gold_spans)
-    return _intersection_length(gold, retrieved) / denominator
-
-
-def _value(row: Any, field: str, default: Any = None) -> Any:
-    if isinstance(row, Mapping):
-        return row.get(field, default)
-    return getattr(row, field, default)
-
-
-def _has_hits(row: Any) -> bool:
-    for field in (
-        "retrieved_case_ids",
-        "retrieved_chunk_ids",
-        "retrieved_spans",
-    ):
-        if _value(row, field, []):
-            return True
-    return False
-
-
-def empty_result_rate(rows: Sequence[Any]) -> float:
-    if not rows:
-        return 0.0
-    return sum(not _has_hits(row) for row in rows) / len(rows)
-
-
-def refusal_accuracy(rows: Sequence[Any]) -> float:
-    negatives = [row for row in rows if _value(row, "answerable", True) is False]
+def refusal_accuracy(predictions: Sequence[Prediction]) -> float:
+    """Accuracy on negative controls (unanswerable queries)."""
+    negatives = [p for p in predictions if not p.answerable]
     if not negatives:
         return 0.0
-    return sum(not _has_hits(row) for row in negatives) / len(negatives)
+    return sum(p.empty for p in negatives) / len(negatives)
 
 
-def _percentile(values: Sequence[float], percentile: float) -> float:
+def latency_percentiles(latencies_ms: Sequence[float]) -> dict[str, float | None]:
+    values = [float(v) for v in latencies_ms if isfinite(v) and v >= 0]
     if not values:
-        raise ValueError("No observations")
-    position = (len(values) - 1) * percentile
-    lower = int(position)
-    upper = min(lower + 1, len(values) - 1)
-    weight = position - lower
-    return values[lower] * (1 - weight) + values[upper] * weight
+        return {"p50_ms": None, "p95_ms": None, "mean_ms": None}
 
-
-def latency_percentiles(
-    latencies_ms: Sequence[float],
-) -> dict[str, float | None]:
-    values = []
-    for value in latencies_ms:
-        number = float(value)
-        if not isfinite(number) or number < 0:
-            raise ValueError(f"Invalid latency: {value!r}")
-        values.append(number)
-    if not values:
-        return {
-            "p50_ms": None,
-            "p95_ms": None,
-            "mean_ms": None,
-            "min_ms": None,
-            "max_ms": None,
-        }
     ordered = sorted(values)
     return {
-        "p50_ms": _percentile(ordered, 0.50),
-        "p95_ms": _percentile(ordered, 0.95),
+        "p50_ms": float(np.percentile(ordered, 50)),
+        "p95_ms": float(np.percentile(ordered, 95)),
         "mean_ms": sum(ordered) / len(ordered),
-        "min_ms": ordered[0],
-        "max_ms": ordered[-1],
     }
+
+
+__all__ = [
+    "Prediction",
+    "FailureMode",
+    "analyze_failure",
+    "bootstrap_ci",
+    "recall_at_k",
+    "ndcg_at_k",
+    "mrr",
+    "empty_result_rate",
+    "refusal_accuracy",
+    "latency_percentiles",
+]

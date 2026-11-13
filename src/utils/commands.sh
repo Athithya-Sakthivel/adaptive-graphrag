@@ -1,25 +1,5 @@
 
 
-cd /workspace/src/utils
-python3 -m venv .venv
-source .venv/bin/activate
-
-pip install -r requirements.inspect.txt -q
-cd /workspace
-
-# Full inspection
-python3 src/utils/inspect_data.py /workspace/tmp/data/raw \
-  --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16 \
-  --sample 500 --chunker-sample 30
-
-# Single case deep-dive
-python3 src/utils/inspect_data.py /workspace/tmp/data/raw \
-  --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16 \
-  --inspect-one 1088107
-cd /workspace/src
-
-
-
 
 # 1. Persistent volume (survives container restarts)
 docker volume create legal_pgdata
@@ -99,29 +79,3 @@ export DATABASE_URL="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
 python -m indexing_pipeline.cli load --log-level INFO 2>&1 | tee /tmp/load.log
 python -m indexing_pipeline.cli validate --log-level INFO 2>&1 | tee /tmp/validate.log
 python -m indexing_pipeline.cli index --log-level INFO 2>&1 | tee /tmp/index.log
-
-
-cd /workspace
-source /workspace/src/utils/.venv/bin/activate
-
-python3 src/utils/inspect_chunks.py \
-  --chunked-dir /workspace/tmp/data/chunked \
-  --tokenizer-path /workspace/src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16
-
-
-
-cd /workspace
-source /workspace/src/utils/.venv/bin/activate
-python3 src/utils/inspect_graph.py
-
-
-mkdir -p /workspace/src/indexing_pipeline/embedder
-hf download Athithya117/dinghy-law-0.6b-v1-openvino-fp16 \
-  --repo-type model \
-  --local-dir /workspace/src/indexing_pipeline/embedders
-
-
-find src \
-  \( -type d \( -name '.venv' -o -name 'embedder' \) -prune \) -o \
-  \( -type f -name '*.py' -print0 \) |
-  xargs -0 -r pre-commit run basedpyright --files

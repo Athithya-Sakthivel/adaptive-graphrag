@@ -1,7 +1,0 @@
-embedder/
-*.gguf
-*.parquet
-__pycache__/
-.venv/
-models
-data

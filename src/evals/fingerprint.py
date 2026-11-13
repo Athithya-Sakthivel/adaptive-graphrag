@@ -1,31 +1,35 @@
-"""Canonical corpus fingerprints for eval reproducibility.
+"""Canonical corpus fingerprint for eval reproducibility.
 
-The same fingerprint implementation must be used by both the gold builder
-(`eval_source.py`) and the eval runtime (`eval_adapter.py`). If they
-diverge, `run_eval.py` refuses to score — and a silent divergence means
-you'd be measuring "chunker drift" not "retrieval quality".
+The fingerprint is a SHA-256 digest over the complete state of the
+indexed corpus: chunker versions, chunk IDs, case IDs, and citation
+edges. If any of these change (re-chunking, new data, edge filter
+change), the fingerprint changes and the eval runner will refuse to
+score against a gold set built on a different corpus state.
 
-LegalBench uses a separate fingerprint (`legalbench_fingerprint`) because
-its corpus is contract text, not case law.
+This prevents silent "chunker drift" — measuring retrieval quality
+against a gold set whose chunk boundaries no longer match the index.
 """
 
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 
-import psycopg
+from psycopg import Connection
 
 _SCHEMA_VERSION = "case-law-v1"
 
 
-def case_law_fingerprint(conn: psycopg.Connection) -> str:
-    """SHA-256 over the canonical case-law corpus state.
+def case_law_fingerprint(conn: Connection) -> str:
+    """Compute SHA-256 over canonical case-law corpus state.
 
-    Detects drift in: chunker versions, chunk IDs (which encode section +
-    index, so a re-chunk flips the hash), case IDs, and citation edges.
+    Deterministic given the same database state. Costs ~1-2s on a
+    17K-chunk corpus; run once per eval session.
 
-    Costs ~1-2s on a 17K-chunk corpus. Run once per eval session.
+    Drift detected in:
+        - chunker_version (any re-chunk flips the hash)
+        - chunk_id set (encodes section + index)
+        - case_id set
+        - citation edge set (source, target, relation)
     """
     digest = hashlib.sha256()
     digest.update(f"schema={_SCHEMA_VERSION}\0".encode())
@@ -56,8 +60,4 @@ def case_law_fingerprint(conn: psycopg.Connection) -> str:
     return digest.hexdigest()
 
 
-def legalbench_fingerprint(corpus_root: Path) -> str:
-    """LegalBench corpus fingerprint (independent of case-law)."""
-    from evals.legalbench_rag import corpus_fingerprint
-
-    return corpus_fingerprint(corpus_root)
+__all__ = ["case_law_fingerprint"]

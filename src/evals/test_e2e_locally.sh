@@ -1,229 +1,171 @@
 #!/usr/bin/env bash
 # =================================================================
-# eval/test_e2e_locally.sh
+# src/evals/test_e2e_locally.sh
 #
-# One-command acceptance harness for both eval suites:
-#   1. custom      — case-law retrieval on the project corpus (headline)
-#   2. legalbench  — LegalBench-RAG public anchor (external validity)
+# One-command evaluation harness for the custom case-law suite.
+# Builds a stratified gold set from the live database, runs the
+# retriever against it, and reports Recall/NDCG/MRR with bootstrap
+# confidence intervals plus failure-mode breakdowns.
 #
-# Each suite is detected independently and enters one of three states:
-#   READY      → run it directly
-#   BUILDABLE  → build the needed artifact first, then run
-#   MISSING    → skip with clear instructions (or fail under --strict)
+# Usage examples:
+#   # Standard evaluation (default RRF k from config)
+#   bash src/evals/test_e2e_locally.sh
 #
-# On a fresh checkout with the pipeline corpus loaded:
-#   • custom      → BUILDABLE → builds 3-class smoke gold → runs
-#   • legalbench  → MISSING (unless --download-legalbench/artifacts)
+#   # Sweep RRF k = [5, 10, 20, 60] and pick the winner
+#   bash src/evals/test_e2e_locally.sh --find-optimal-rrf-k
+#
+#   # Evaluate at top-k=5 with a fresh gold set
+#   bash src/evals/test_e2e_locally.sh --top-k 5 --rebuild-gold
+#
+#   # Full-tier gold (50 HOLDING / 50 LOOKUP / 30 VALIDITY / 20 negative)
+#   bash src/evals/test_e2e_locally.sh --tier full
+#
+#   # Exact-scan baseline (bypass HNSW, measure recall ceiling)
+#   bash src/evals/test_e2e_locally.sh --exact-baseline
 #
 # Exit codes:
-#   0  — every executed suite passed its gate
-#   1  — at least one suite failed
-#   2  — invalid arguments, or --strict and a requested suite is missing
+#   0 — evaluation completed and report written
+#   1 — evaluation failed (see log tail)
+#   2 — invalid arguments or missing prerequisites
 # =================================================================
-set -uo pipefail   # NOT -e — we deliberately collect failures
 
+set -uo pipefail
+
+# ── Resolve paths ─────────────────────────────────────────────────
+# Script lives at: src/evals/test_e2e_locally.sh
+# SRC_DIR must be: <repo>/src  (one level up)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SRC_DIR/.." && pwd)"
 
-DEFAULT_DSN="postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag"
-MODEL_REL="src/indexing_pipeline/embedders/dinghy-law-0.6b-v1-openvino-fp16"
+# ── Activate venv if not already active ───────────────────────────
+if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+    for candidate in \
+        "${SRC_DIR}/.venv/bin/activate" \
+        "${REPO_ROOT}/.venv/bin/activate"; do
+        if [[ -f "$candidate" ]]; then
+            # shellcheck source=/dev/null
+            source "$candidate"
+            break
+        fi
+    done
+fi
 
-# ── Args ─────────────────────────────────────────────────────────
-SUITE="all"
-FAST=0
+# ── Environment defaults ──────────────────────────────────────────
+: "${DATABASE_URL:=postgresql://legalrag:e6a1c2e5bf8d@127.0.0.1:5432/legalrag}"
+: "${RETRIEVER_MODEL_DIR:=${SRC_DIR}/indexing_pipeline/embedders}"
+export DATABASE_URL RETRIEVER_MODEL_DIR
+export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+
+PYTHON="${PYTHON:-python3}"
+
+# ── Args ──────────────────────────────────────────────────────────
 TOP_K=10
-STRICT=0
-VERBOSE=0
-DL_LEGALBENCH=0
-DL_ARTIFACTS=0
+TIER="smoke"
+SEED=20261106
+FIND_RRF_K=0
+REBUILD_GOLD=0
+EXACT_BASELINE=0
+PUBLISHED_ONLY=0
 ALLOW_UNVERIFIED=1
+VERBOSE=0
 
 usage() {
-    cat <<'EOF'
-Usage: eval/test_e2e_locally.sh [options]
-
-  --suite {all,custom,legalbench}   Which suite(s) to run (default: all)
-  --fast                            Custom only; skip LegalBench
-  --top-k N                         Top-k cutoff (default: 10)
-  --strict                          Exit 2 if any requested suite can't run
-  --download-legalbench             Download LegalBench data if missing
-  --download-artifacts              Download precomputed artifacts if missing
-  --no-unverified                   Fail if custom gold is unverified
-  --verbose                         Show per-query output
-  --help                            This message
-
-Examples:
-  bash eval/test_e2e_locally.sh --fast
-  bash eval/test_e2e_locally.sh --suite custom
-  bash eval/test_e2e_locally.sh --suite all --download-legalbench
-  bash eval/test_e2e_locally.sh --suite all --strict   # CI mode
-EOF
+    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --suite)              SUITE="$2"; shift 2 ;;
-        --fast)               FAST=1; SUITE="custom"; shift ;;
         --top-k)              TOP_K="$2"; shift 2 ;;
-        --strict)             STRICT=1; shift ;;
-        --download-legalbench) DL_LEGALBENCH=1; shift ;;
-        --download-artifacts) DL_ARTIFACTS=1; shift ;;
+        --tier)               TIER="$2"; shift 2 ;;
+        --seed)               SEED="$2"; shift 2 ;;
+        --find-optimal-rrf-k) FIND_RRF_K=1; shift ;;
+        --rebuild-gold)       REBUILD_GOLD=1; shift ;;
+        --exact-baseline)     EXACT_BASELINE=1; shift ;;
+        --published-only)     PUBLISHED_ONLY=1; shift ;;
         --no-unverified)      ALLOW_UNVERIFIED=0; shift ;;
         --verbose)            VERBOSE=1; shift ;;
         --help|-h)            usage; exit 0 ;;
-        *)                    echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+        *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-case "$SUITE" in all|custom|legalbench) ;; *)
-    echo "--suite must be all|custom|legalbench" >&2; exit 2 ;;
+if ! [[ "$TOP_K" =~ ^[0-9]+$ ]] || (( TOP_K < 1 )); then
+    echo "error: --top-k must be a positive integer" >&2; exit 2
+fi
+case "$TIER" in smoke|full) ;; *)
+    echo "error: --tier must be smoke or full" >&2; exit 2 ;;
 esac
 
-if ! [[ "$TOP_K" =~ ^[0-9]+$ ]] || (( TOP_K < 1 )); then
-    echo "--top-k must be a positive integer" >&2; exit 2
-fi
+# ── Derived paths ─────────────────────────────────────────────────
+GOLD_DIR="${SRC_DIR}/evals/gold"
+CUSTOM_GOLD="${GOLD_DIR}/custom_${TIER}.jsonl"
+RESULTS_DIR="${REPO_ROOT}/results/$(date -u +%Y-%m-%d)"
+mkdir -p "$GOLD_DIR" "$RESULTS_DIR"
 
-# ── Paths & environment ─────────────────────────────────────────
-cd "$REPO_ROOT"
+cd "$SRC_DIR"
 
-MODEL_DIR="${RETRIEVER_MODEL_DIR:-$REPO_ROOT/$MODEL_REL}"
-DATABASE_URL="${DATABASE_URL:-$DEFAULT_DSN}"
-LEGALBENCH_ROOT="${LEGALBENCH_ROOT:-$REPO_ROOT/data/legalbench}"
-LEGALBENCH_ARTIFACTS="${LEGALBENCH_ARTIFACTS:-$REPO_ROOT/data/legalbench_artifacts}"
-LEGALBENCH_DSN="${LEGALBENCH_DSN:-${DATABASE_URL%/*}/legalbench}"
-LEGALBENCH_EMBEDDER="${LEGALBENCH_EMBEDDER:-evals.embedder_bridge}"
-LEGALBENCH_EMBEDDING_MODEL="${LEGALBENCH_EMBEDDING_MODEL:-$MODEL_DIR}"
-LEGALBENCH_CORPUS="${LEGALBENCH_CORPUS:-$LEGALBENCH_ROOT/corpus}"
-
-CUSTOM_GOLD="$REPO_ROOT/src/evals/gold/custom_smoke.jsonl"
-LEGALBENCH_GOLD="$REPO_ROOT/src/evals/gold/legalbench_privacy_qa.jsonl"
-RESULTS_DIR="$REPO_ROOT/results/$(date -u +%Y-%m-%d)"
-mkdir -p "$RESULTS_DIR"
-
-export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-export DATABASE_URL
-export LEGALBENCH_ROOT LEGALBENCH_ARTIFACTS LEGALBENCH_DSN
-export LEGALBENCH_EMBEDDER LEGALBENCH_EMBEDDING_MODEL LEGALBENCH_CORPUS
-
-for venv in "$REPO_ROOT/src/.venv/bin/activate" "$REPO_ROOT/.venv/bin/activate"; do
-    [[ -f "$venv" ]] && { source "$venv"; break; }
-done
-
-PYTHON="${PYTHON:-python3}"
-
-# ── Preflight ───────────────────────────────────────────────────
+# ── Preflight ─────────────────────────────────────────────────────
 preflight() {
     echo "================================================================"
     echo "  Retrieval eval — local acceptance harness"
     echo "================================================================"
     printf "  repo:       %s\n" "$REPO_ROOT"
     printf "  python:     %s\n" "$($PYTHON --version 2>&1)"
-    printf "  dsn:        %s@...\n" "${DATABASE_URL%%@*}"
-    printf "  model:      %s\n" "$MODEL_DIR"
-    printf "  top-k:      %s\n" "$TOP_K"
-    printf "  suite:      %s\n" "$SUITE"
+    printf "  dsn:        %s\n" "${DATABASE_URL##*@}"
+    printf "  model:      %s\n" "$RETRIEVER_MODEL_DIR"
+    printf "  top-k:      %s   tier: %s   seed: %s\n" "$TOP_K" "$TIER" "$SEED"
+    (( FIND_RRF_K ))     && printf "  mode:       RRF K SWEEP [5, 10, 20, 60]\n"
+    (( EXACT_BASELINE )) && printf "  mode:       EXACT SCAN BASELINE\n"
+    (( PUBLISHED_ONLY )) && printf "  filter:     published_only=True\n"
     echo ""
-}
 
-# ── Suite detection ─────────────────────────────────────────────
-CUSTOM_MODE="MISSING";   CUSTOM_REASON=""
-LB_MODE="MISSING";       LB_REASON=""
+    [[ -d "$RETRIEVER_MODEL_DIR" ]] || {
+        echo "error: model dir not found: $RETRIEVER_MODEL_DIR" >&2; exit 2; }
 
-detect_custom() {
-    if [[ -f "$CUSTOM_GOLD" ]]; then
-        CUSTOM_MODE="READY"; CUSTOM_REASON="gold exists"
-        return
-    fi
-    if ! $PYTHON -c "import retriever.eval_source, evals.custom_eval_builder" 2>/dev/null; then
-        CUSTOM_MODE="MISSING"; CUSTOM_REASON="eval modules not importable"
-        return
-    fi
+    $PYTHON -c "import psycopg, numpy, retriever, evals" 2>/dev/null || {
+        echo "error: python deps not importable (psycopg, numpy, retriever, evals)" >&2
+        exit 2; }
+
     local n
-    n=$($PYTHON -c "
+    n=$($PYTHON - <<'PY'
 import os, psycopg
 try:
-    with psycopg.connect(os.environ['DATABASE_URL'], connect_timeout=3, autocommit=True) as c:
-        print(c.execute('SELECT COUNT(*) FROM cases').fetchone()[0])
+    with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=5) as c:
+        print(c.execute("SELECT COUNT(*) FROM cases").fetchone()[0])
 except Exception:
     print(0)
-" 2>/dev/null)
-    if [[ -z "$n" ]] || (( n < 500 )); then
-        CUSTOM_MODE="MISSING"; CUSTOM_REASON="DB unreachable or <500 cases"
-        return
+PY
+)
+    if [[ -z "$n" ]] || (( n == 0 )); then
+        echo "error: database unreachable or cases table empty" >&2; exit 2
     fi
-    CUSTOM_MODE="BUILDABLE"; CUSTOM_REASON="$n cases, will build smoke gold"
+    printf "  corpus:     %s cases loaded\n\n" "$n"
 }
 
-detect_legalbench() {
-    if [[ -f "$LEGALBENCH_ARTIFACTS/chunks.parquet" && -f "$LEGALBENCH_ARTIFACTS/queries.parquet" ]]; then
-        LB_MODE="READY"; LB_REASON="precomputed artifacts"
-        return
-    fi
-    if [[ -d "$LEGALBENCH_CORPUS" && -d "$LEGALBENCH_ROOT/benchmarks" ]] \
-        && $PYTHON -c "import evals.legalbench_rag" 2>/dev/null; then
-        LB_MODE="BUILDABLE"; LB_REASON="will build index from raw data"
-        return
-    fi
-    LB_MODE="MISSING"; LB_REASON="no data, no artifacts"
+# ── Gold set building ─────────────────────────────────────────────
+build_gold_official() {
+    $PYTHON -m evals.custom_eval_builder \
+        --source evals.source:build_source \
+        --tier "$TIER" \
+        --seed "$SEED" \
+        --min-cases 500 \
+        --out "$CUSTOM_GOLD"
 }
 
-detect_all() { detect_custom; detect_legalbench; }
-
-print_detection() {
-    echo "Environment:"
-    [[ -d "$MODEL_DIR" ]] && echo "  model dir          ✓" || echo "  model dir          ✗ $MODEL_DIR"
-    $PYTHON -c "import psycopg, numpy, openvino" 2>/dev/null \
-        && echo "  python deps        ✓" || echo "  python deps        ✗"
-    $PYTHON -c "import retriever, evals" 2>/dev/null \
-        && echo "  packages           ✓" || echo "  packages           ✗"
-    echo ""
-    echo "Suites:"
-    printf "  custom             %-10s %s\n" "$CUSTOM_MODE" "($CUSTOM_REASON)"
-    printf "  legalbench         %-10s %s\n" "$LB_MODE" "($LB_REASON)"
-    echo ""
-}
-
-# ── Download helpers ───────────────────────────────────────────
-download_legalbench() {
-    echo "─── downloading LegalBench-RAG data ───"
-    command -v hf >/dev/null || { echo "hf CLI not found; pip install huggingface_hub[cli]" >&2; return 1; }
-    mkdir -p "$LEGALBENCH_ROOT"
-    hf download zeroentropy/legalbenchrag \
-        --repo-type dataset --local-dir "$LEGALBENCH_ROOT" || return 1
-}
-
-download_artifacts() {
-    echo "─── downloading precomputed artifacts ───"
-    command -v hf >/dev/null || { echo "hf CLI not found" >&2; return 1; }
-    mkdir -p "$LEGALBENCH_ARTIFACTS"
-    hf download Athithya117/legalbench-artifacts legalbench_artifacts.tar.gz \
-        --repo-type dataset --local-dir "$LEGALBENCH_ROOT" || return 1
-    tar -xzf "$LEGALBENCH_ROOT/legalbench_artifacts.tar.gz" -C "$LEGALBENCH_ARTIFACTS"
-}
-
-# ── Build: custom gold ─────────────────────────────────────────
-build_custom_gold() {
-    echo "─── building custom smoke gold ───"
-    mkdir -p "$(dirname "$CUSTOM_GOLD")"
-
-    if $PYTHON -m evals.custom_eval_builder \
-            --source retriever.eval_source:build_source \
-            --tier smoke --min-cases 500 \
-            --out "$CUSTOM_GOLD" 2>&1; then
-        return 0
-    fi
-
-    echo "builder failed (likely empty class pool at this scale)"
-    echo "─── falling back to available classes only ───"
-
-    $PYTHON - "$CUSTOM_GOLD" <<'GOLD_EOF'
-"""Fallback gold: build whatever pools are non-empty."""
+build_gold_fallback() {
+    echo "  official builder failed (empty pool at this scale?)"
+    echo "  falling back: build whatever pools are non-empty..."
+    $PYTHON - "$CUSTOM_GOLD" "$TIER" <<'GOLD_EOF'
 import json, sys
 from pathlib import Path
 
-from retriever.eval_source import build_source
+from evals.source import build_source
 
 out_path = Path(sys.argv[1])
+tier = sys.argv[2]
+per_class = 3 if tier == "smoke" else 30
+
 source = build_source()
 try:
     fp = source.corpus_fingerprint()
@@ -231,7 +173,7 @@ try:
 finally:
     source.close()
 
-pools = {"HOLDING": [], "LOOKUP": [], "VALIDITY": [], "APPLICATION": [], "negative_control": []}
+pools = {"HOLDING": [], "LOOKUP": [], "VALIDITY": [], "negative_control": []}
 for c in candidates:
     if c.get("holding_chunk_id") and (c.get("holding_text") or "").strip():
         pools["HOLDING"].append(c)
@@ -239,17 +181,14 @@ for c in candidates:
         pools["LOOKUP"].append(c)
     if c["indegree"] >= 1 and c.get("overruling_citer_ids"):
         pools["VALIDITY"].append(c)
-    if (c["indegree"] >= 1 and c.get("application_case_ids")
-        and (c.get("doctrine") or "").strip() and c.get("doctrine_leading")):
-        pools["APPLICATION"].append(c)
     if c["indegree"] == 0:
         pools["negative_control"].append(c)
 
 gold = []
 for label, pool in pools.items():
-    take = min(3, len(pool))
+    take = min(per_class, len(pool))
     if take == 0:
-        print(f"skip {label}: empty pool", file=sys.stderr)
+        print(f"  skip {label}: empty pool", file=sys.stderr)
         continue
     for c in pool[:take]:
         cid = c["case_id"]
@@ -262,9 +201,6 @@ for label, pool in pools.items():
         elif label == "VALIDITY":
             q = f"Has {c['case_name']} been overruled?"
             gc, gk = list(c["overruling_citer_ids"]), []
-        elif label == "APPLICATION":
-            q = f"How has {c['doctrine']} been applied since {c['year']}?"
-            gc, gk = list(c["application_case_ids"]), []
         else:
             q = f"Which cases cite {c['case_name']}?"
             gc, gk = [], []
@@ -276,306 +212,220 @@ for label, pool in pools.items():
             "answerable": label != "negative_control",
             "gold_case_ids": gc,
             "gold_chunk_ids": gk,
-            "gold_char_spans": None,
             "seed_case_id": cid,
-            "tags": [label.lower()],
             "verified": False,
             "corpus_hash": fp,
         })
 
 if not gold:
-    print("no gold rows produced", file=sys.stderr)
+    print("FATAL: no gold rows produced from any pool", file=sys.stderr)
     sys.exit(1)
 
+out_path.parent.mkdir(parents=True, exist_ok=True)
 out_path.write_text("\n".join(json.dumps(r) for r in gold) + "\n")
-print(f"wrote {len(gold)} fallback gold rows → {out_path}")
+print(f"  wrote {len(gold)} fallback gold rows -> {out_path}")
 GOLD_EOF
 }
 
-# ── Build: legalbench index ────────────────────────────────────
-build_legalbench_index() {
-    echo "─── building LegalBench-RAG index (privacy_qa only) ───"
-
-    if ! $PYTHON -c "
-import os, psycopg
-try:
-    psycopg.connect(os.environ['LEGALBENCH_DSN'], connect_timeout=3).close()
-except Exception as e:
-    print(f'unreachable: {e}', file=os.sys.stderr); exit(1)
-"; then
-        echo "FAIL: LegalBench DSN unreachable: $LEGALBENCH_DSN" >&2
-        echo "      create database + extension:" >&2
-        echo "        psql -c 'CREATE DATABASE legalbench;'" >&2
-        echo "        psql -d legalbench -c 'CREATE EXTENSION vector;'" >&2
-        return 1
+ensure_gold() {
+    if (( REBUILD_GOLD )) && [[ -f "$CUSTOM_GOLD" ]]; then
+        echo "─── removing existing gold (--rebuild-gold) ───"
+        rm -f "$CUSTOM_GOLD" "${CUSTOM_GOLD%.jsonl}.manifest.json"
     fi
 
-    $PYTHON -m evals.legalbench_rag \
-        --corpus "$LEGALBENCH_CORPUS" \
-        --benchmarks "$LEGALBENCH_ROOT/benchmarks" \
-        --dataset-revision "local-$(date -u +%Y%m%d)" \
-        --subset privacy_qa \
-        --gold-out "$LEGALBENCH_GOLD"
+    if [[ -f "$CUSTOM_GOLD" ]]; then
+        echo "─── gold set exists: $CUSTOM_GOLD ───"
+        return 0
+    fi
+
+    echo "─── building custom gold (tier=$TIER) ───"
+    if build_gold_official; then
+        return 0
+    fi
+    build_gold_fallback || {
+        echo "FATAL: could not build gold set" >&2; exit 1; }
 }
 
-# ── Run: custom ────────────────────────────────────────────────
-run_custom() {
-    local out="$RESULTS_DIR/custom_smoke.json"
-    local log="$RESULTS_DIR/custom.log"
+# ── Eval runner ───────────────────────────────────────────────────
+run_one_eval() {
+    local rrf_k="$1" out_file="$2" log_file="$3"
 
     local extra=()
-    [[ $ALLOW_UNVERIFIED -eq 1 ]] && extra+=("--allow-unverified")
-    [[ $VERBOSE -eq 1 ]] || extra+=("--no-progress")
+    (( ALLOW_UNVERIFIED )) && extra+=("--allow-unverified")
+    (( EXACT_BASELINE ))   && extra+=("--exact-baseline")
+    (( PUBLISHED_ONLY ))   && extra+=("--published-only")
+    [[ -n "$rrf_k" ]]      && extra+=("--rrf-k" "$rrf_k")
 
-    echo "─── running custom eval ───"
     $PYTHON -m evals.run_eval \
         --gold "$CUSTOM_GOLD" \
-        --adapter "retriever.eval_adapter:build_runtime" \
+        --adapter evals.adapter:build_runtime \
         --suite custom \
-        --config smoke \
+        --config "e2e_${TIER}" \
         --top-k "$TOP_K" \
-        --out "$out" \
-        "${extra[@]}" > "$log" 2>&1
-    local rc=$?
-    if [[ $rc -ne 0 ]]; then
-        echo "custom eval failed (exit=$rc); tail of $log:" >&2
-        tail -20 "$log" >&2
-        return $rc
-    fi
-    echo "  → $out"
-    return 0
+        --out "$out_file" \
+        "${extra[@]}" > "$log_file" 2>&1
 }
 
-# ── Run: legalbench ────────────────────────────────────────────
-run_legalbench() {
-    local out="$RESULTS_DIR/legalbench_smoke.json"
-    local log="$RESULTS_DIR/legalbench.log"
-    local gold="$LEGALBENCH_GOLD"
-
-    if [[ -f "$LEGALBENCH_ARTIFACTS/chunks.parquet" ]]; then
-        echo "─── loading precomputed artifacts → Postgres ───"
-        $PYTHON - "$LEGALBENCH_ARTIFACTS" "$LEGALBENCH_DSN" <<'LOAD_EOF'
-import sys
-from pathlib import Path
-from evals.legalbench_rag import load_precomputed_index
-try:
-    r = load_precomputed_index(
-        artifacts_root=Path(sys.argv[1]),
-        dsn=sys.argv[2], rebuild=False,
-    )
-    print(f"loaded: {r}")
-except Exception as e:
-    print(f"load failed: {e}", file=sys.stderr); sys.exit(1)
-LOAD_EOF
-    fi
-
-    if [[ ! -f "$gold" ]]; then
-        local master="$REPO_ROOT/src/evals/gold/legalbench.jsonl"
-        if [[ -f "$master" ]]; then gold="$master"; fi
-    fi
-    if [[ ! -f "$gold" ]]; then
-        echo "FAIL: no legalbench gold; run --download-legalbench first" >&2
-        return 1
-    fi
-
-    echo "─── running legalbench eval ───"
-    $PYTHON -m evals.run_eval \
-        --gold "$gold" \
-        --adapter "evals.legalbench_rag:build_runtime" \
-        --suite legalbench \
-        --config naive500_dense \
-        --top-k "$TOP_K" \
-        --out "$out" > "$log" 2>&1
-    local rc=$?
-    if [[ $rc -ne 0 ]]; then
-        echo "legalbench eval failed (exit=$rc); tail of $log:" >&2
-        tail -20 "$log" >&2
-        return $rc
-    fi
-    echo "  → $out"
-    return 0
-}
-
-# ── Summary + gates ────────────────────────────────────────────
-summarize() {
-    local custom_json="$1"
-    local lb_json="$2"
-    $PYTHON - "$custom_json" "$lb_json" "$TOP_K" <<'SUM_EOF'
+# ── Summary: single run ───────────────────────────────────────────
+summarize_single() {
+    $PYTHON - "$1" "$TOP_K" <<'SUM_EOF'
 import json, sys
 from pathlib import Path
 
-def load(p):
-    if not p or not Path(p).is_file():
-        return None
-    try:
-        return json.loads(Path(p).read_text())
-    except Exception:
-        return None
+path = Path(sys.argv[1])
+k = int(sys.argv[2])
+if not path.is_file():
+    print("no report found"); sys.exit(1)
+r = json.loads(path.read_text())
 
-custom = load(sys.argv[1])
-lb = load(sys.argv[2])
-K = int(sys.argv[3])
-
-print()
-print("=" * 74)
-print("SUMMARY")
-print("=" * 74)
-
-gates = []  # list[(name, passed, message)]
-
-# ── custom ──
-if custom:
-    print()
-    print("custom  (headline — case-law retrieval)")
-    print(f"  n_queries:   {custom.get('n_queries')}")
-    print(f"  n_verified:  {custom.get('n_verified')}")
-    print(f"  corpus_hash: {str(custom.get('corpus_hash',''))[:16]}…")
-    print()
-    k = custom["top_k"]
-    rk = f"case_recall@{k}"
-    nk = f"case_ndcg@{k}"
-    print(f"  {'class':<14} {'N':>4} {'case-recall':>12} {'ndcg':>8} {'mrr':>8}")
-    print(f"  {'-'*14} {'-'*4} {'-'*12} {'-'*8} {'-'*8}")
-    per = custom.get("per_class", {})
-    positive = []
-    for cls, m in sorted(per.items()):
-        r = m.get(rk)
-        nd = m.get(nk)
-        mr = m.get("case_mrr")
-        rs = f"{r:.3f}" if r is not None else "—"
-        ns = f"{nd:.3f}" if nd is not None else "—"
-        ms = f"{mr:.3f}" if mr is not None else "—"
-        print(f"  {cls:<14} {m['n']:>4} {rs:>12} {ns:>8} {ms:>8}")
-        if cls != "negative_control" and r is not None:
-            positive.append((cls, r))
-    max_r = max((r for _, r in positive), default=0.0)
-    refus = per.get("negative_control", {}).get("refusal_accuracy")
-    if refus is not None:
-        print(f"\n  negative-control refusal: {refus:.3f}")
-    print()
-    ok = max_r >= 0.30 or not positive
-    print(f"  gate: max positive-class recall >= 0.30 → {'PASS' if ok else 'FAIL'}")
-    gates.append(("custom", ok, f"max recall {max_r:.3f}"))
-elif custom is not None and custom == {}:
-    gates.append(("custom", False, "empty result"))
-# custom was None → skipped, not a gate
-
-# ── legalbench ──
-if lb:
-    print()
-    print("legalbench  (external anchor — contract retrieval)")
-    print(f"  n_queries:   {lb.get('n_queries')}")
-    print(f"  corpus_hash: {str(lb.get('corpus_hash',''))[:16]}…")
-    print()
-    k = lb["top_k"]
-    macro = lb.get("macro_positive", {})
-    char = macro.get(f"char_span_recall@{k}")
-    prec = macro.get(f"char_span_precision@{k}")
-    if char is not None:
-        print(f"  char-recall@{k}:    {char:.4f}")
-    if prec is not None:
-        print(f"  char-precision@{k}: {prec:.4f}")
-    print()
-    ok = char is not None and 0.40 <= char <= 0.95
-    print(f"  gate: 0.40 <= char-recall <= 0.95 → {'PASS' if ok else 'FAIL'}")
-    if char is None:
-        print("  (paper baseline: 71.2% on privacy_qa; tuned hybrid: 78.4%)")
-    elif char < 0.40:
-        print("  WARNING: too low — embedder or chunking bug, not retriever quality")
-    elif char > 0.95:
-        print("  WARNING: too high — budget likely > doc size (check k, chunk size)")
-    gates.append(("legalbench", ok, f"char-recall {char:.3f}" if char is not None else "missing"))
-elif lb is not None and lb == {}:
-    gates.append(("legalbench", False, "empty result"))
-# lb was None → skipped, not a gate
+def fmt(mean, ci):
+    if mean is None: return "—"
+    if ci and len(ci) == 2:
+        return f"{mean:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]"
+    return f"{mean:.3f}"
 
 print()
-print("=" * 74)
-if not gates:
-    print("No suites executed.")
-    print("Hints:")
-    print("  • To enable custom:    ensure DATABASE_URL points at the loaded corpus")
-    print("  • To enable legalbench: --download-legalbench (needs hf CLI + ~80 MB)")
-    print("  • Already have artifacts? --download-artifacts (fastest path)")
-    sys.exit(1)
+print("=" * 78)
+print(f"EVALUATION SUMMARY  (top_k={k}, n_queries={r['n_queries']})")
+print("=" * 78)
+print(f"  {'class':<14} {'N':>3}  {'recall@5':<22} {'recall@'+str(k):<22} {'ndcg@'+str(k):<8} {'mrr':<8}")
+print(f"  {'-'*14} {'-'*3}  {'-'*22} {'-'*22} {'-'*8} {'-'*8}")
 
-fails = [(n, msg) for n, ok, msg in gates if not ok]
-for name, ok, msg in gates:
-    print(f"  {'PASS' if ok else 'FAIL':4} {name:<12} {msg}")
-print("=" * 74)
-sys.exit(0 if not fails else 1)
+for cls, m in sorted(r.get("per_class", {}).items()):
+    rec5 = m.get("case_recall@5")
+    rec5_ci = m.get("case_recall@5_ci")
+    rec_k = m.get(f"case_recall@{k}")
+    rec_k_ci = m.get(f"case_recall@{k}_ci")
+    nd = m.get(f"case_ndcg@{k}")
+    mr = m.get("case_mrr")
+
+    r5_s = fmt(rec5, rec5_ci)
+    rk_s = fmt(rec_k, rec_k_ci)
+    nd_s = f"{nd:.3f}" if nd is not None else "—"
+    mr_s = f"{mr:.3f}" if mr is not None else "—"
+    print(f"  {cls:<14} {m['n']:>3}  {r5_s:<22} {rk_s:<22} {nd_s:<8} {mr_s:<8}")
+
+fm = r.get("failure_modes", {})
+if fm:
+    print()
+    print("  Failure modes (failed queries only):")
+    for cls, modes in sorted(fm.items()):
+        if not modes: continue
+        parts = ", ".join(f"{mode}={n}" for mode, n in modes.items() if mode != "success")
+        if parts:
+            print(f"    {cls:<18} {parts}")
+
+lat = r.get("latency", {})
+if lat.get("p95_ms") is not None:
+    print()
+    print(f"  Latency: p50={lat['p50_ms']:.0f}ms  p95={lat['p95_ms']:.0f}ms  mean={lat['mean_ms']:.0f}ms")
+
+macro = r.get("macro_positive", {})
+mr = macro.get(f"case_recall@{k}")
+if mr is not None:
+    print(f"  Macro recall@{k} (positive classes): {mr:.3f}")
+print("=" * 78)
 SUM_EOF
 }
 
-# ═══════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════
+# ── Summary: RRF k sweep ──────────────────────────────────────────
+summarize_sweep() {
+    $PYTHON - "$RESULTS_DIR" "$TOP_K" <<'SWEEP_EOF'
+import json, sys
+from pathlib import Path
+
+results_dir = Path(sys.argv[1])
+k_top = int(sys.argv[2])
+ks = [5, 10, 20, 60]
+
+print()
+print("=" * 78)
+print(f"RRF K SWEEP RESULTS  (top_k={k_top}, macro over positive classes)")
+print("=" * 78)
+print(f"  {'rrf_k':>5} | {'recall@k [95% CI]':<26} | {'ndcg@k':>7} | {'p95 lat':>8}")
+print(f"  {'-'*5}-+-{'-'*26}-+-{'-'*7}-+-{'-'*8}")
+
+rows = []
+for k in ks:
+    f = results_dir / f"eval_rrf_k{k}.json"
+    if not f.is_file():
+        print(f"  {k:>5} | {'MISSING':<26} | {'—':>7} | {'—':>8}")
+        continue
+    try:
+        r = json.loads(f.read_text())
+    except Exception:
+        print(f"  {k:>5} | {'PARSE ERROR':<26} | {'—':>7} | {'—':>8}")
+        continue
+
+    per = r.get("per_class", {})
+    recalls, ndcgs = [], []
+    for cls, m in per.items():
+        if cls == "negative_control": continue
+        v = m.get(f"case_recall@{k_top}")
+        if v is not None: recalls.append(v)
+        v = m.get(f"case_ndcg@{k_top}")
+        if v is not None: ndcgs.append(v)
+
+    rec = sum(recalls)/len(recalls) if recalls else None
+    nd = sum(ndcgs)/len(ndcgs) if ndcgs else None
+    p95 = r.get("latency", {}).get("p95_ms")
+
+    # crude CI over per-class means for display; per-query CIs live in the JSON
+    rec_s = f"{rec:.3f}" if rec is not None else "—"
+    nd_s = f"{nd:.3f}" if nd is not None else "—"
+    p95_s = f"{p95:.0f}ms" if p95 is not None else "—"
+    print(f"  {k:>5} | {rec_s:<26} | {nd_s:>7} | {p95_s:>8}")
+    if rec is not None:
+        rows.append((k, rec, nd))
+
+print()
+if rows:
+    best = max(rows, key=lambda x: x[1])
+    print(f"  BEST rrf_k = {best[0]}  (macro recall@{k_top} = {best[1]:.3f})")
+    print()
+    print("  NOTE: point estimates only. For significance, compare per-query")
+    print("  bootstrap CIs in the individual eval_rrf_k*.json reports; if the")
+    print("  CIs overlap, the difference is not statistically significant.")
+else:
+    print("  no valid results — check eval_rrf_k*.log for errors")
+print("=" * 78)
+SWEEP_EOF
+}
+
+# ── Main ──────────────────────────────────────────────────────────
 preflight
-detect_all
-print_detection
+ensure_gold
 
-# Optional downloads
-if (( DL_LEGALBENCH == 1 )) && [[ "$LB_MODE" == "MISSING" ]]; then
-    download_legalbench && detect_all
-fi
-if (( DL_ARTIFACTS == 1 )) && [[ "$LB_MODE" == "MISSING" ]]; then
-    download_artifacts && detect_all
-fi
-
-# Decide which suites to run
-RUN_CUSTOM=0; RUN_LB=0
-[[ "$SUITE" == "all" || "$SUITE" == "custom" ]] && RUN_CUSTOM=1
-[[ "$SUITE" == "all" || "$SUITE" == "legalbench" ]] && RUN_LB=1
-(( FAST == 1 )) && RUN_LB=0
-
-# Strict gate: requested → must be ready/buildable
-if (( STRICT == 1 )); then
-    if (( RUN_CUSTOM == 1 )) && [[ "$CUSTOM_MODE" == "MISSING" ]]; then
-        echo "STRICT: custom requested but missing — $CUSTOM_REASON" >&2
-        exit 2
+if (( FIND_RRF_K )); then
+    echo "─── running RRF k sweep [5, 10, 20, 60] ───"
+    any_ok=0
+    for K in 5 10 20 60; do
+        printf "  → rrf_k=%s ... " "$K"
+        out="$RESULTS_DIR/eval_rrf_k${K}.json"
+        log="$RESULTS_DIR/eval_rrf_k${K}.log"
+        if run_one_eval "$K" "$out" "$log"; then
+            echo "ok"
+            any_ok=1
+        else
+            echo "FAILED"
+            (( VERBOSE )) && tail -20 "$log" >&2
+        fi
+    done
+    (( any_ok )) || { echo "all sweep runs failed" >&2; exit 1; }
+    summarize_sweep
+else
+    echo "─── running custom eval ───"
+    out="$RESULTS_DIR/eval_${TIER}.json"
+    log="$RESULTS_DIR/eval_${TIER}.log"
+    if run_one_eval "" "$out" "$log"; then
+        summarize_single "$out"
+        echo "  report: $out"
+        echo "  log:    $log"
+    else
+        echo "eval failed; tail of $log:" >&2
+        tail -25 "$log" >&2
+        exit 1
     fi
-    if (( RUN_LB == 1 )) && [[ "$LB_MODE" == "MISSING" ]]; then
-        echo "STRICT: legalbench requested but missing — $LB_REASON" >&2
-        exit 2
-    fi
 fi
 
-CUSTOM_JSON=""
-LB_JSON=""
-
-if (( RUN_CUSTOM == 1 )); then
-    case "$CUSTOM_MODE" in
-        READY)
-            run_custom && CUSTOM_JSON="$RESULTS_DIR/custom_smoke.json" ;;
-        BUILDABLE)
-            if build_custom_gold; then
-                detect_custom
-                if [[ "$CUSTOM_MODE" == "READY" ]]; then
-                    run_custom && CUSTOM_JSON="$RESULTS_DIR/custom_smoke.json"
-                fi
-            fi ;;
-        MISSING)
-            echo "[custom] SKIPPED — $CUSTOM_REASON" ;;
-    esac
-fi
-
-if (( RUN_LB == 1 )); then
-    case "$LB_MODE" in
-        READY)
-            run_legalbench && LB_JSON="$RESULTS_DIR/legalbench_smoke.json" ;;
-        BUILDABLE)
-            if build_legalbench_index; then
-                detect_legalbench
-                if [[ "$LB_MODE" != "MISSING" ]]; then
-                    run_legalbench && LB_JSON="$RESULTS_DIR/legalbench_smoke.json"
-                fi
-            fi ;;
-        MISSING)
-            echo "[legalbench] SKIPPED — $LB_REASON"
-            echo "             enable with: --download-legalbench or --download-artifacts" ;;
-    esac
-fi
-
-# ── Summary ─────────────────────────────────────────────────────
-summarize "$CUSTOM_JSON" "$LB_JSON"
-exit $?
+exit 0

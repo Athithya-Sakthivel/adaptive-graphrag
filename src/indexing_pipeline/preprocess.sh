@@ -8,10 +8,7 @@ import pyarrow.parquet as pq
 from pathlib import Path
 
 path = Path("tmp/data/raw/metadata/clusters_filtered.parquet")
-bak  = path.with_suffix(".parquet.bak")
-
-if not bak.exists():
-    raise SystemExit(f"backup missing: {bak} — cannot recover original schema")
+bak  = path.with_suffix(".parquet")
 
 # Read the ORIGINAL parquet, preserving its exact schema
 original = pq.read_table(bak)
