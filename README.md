@@ -1,8 +1,8 @@
 # Adaptive GraphRAG — Legal Precedent Intelligence
 
-**Citation-aware retrieval over US case law.** Answers three query classes: holding (semantic search), citation lookup (graph traversal), and precedent validity (overruling detection).
+[RAG8s](https://github.com/Athithya-Sakthivel/RAG8s/tree/main) is a production-focused cloud RAG platform that achieved 0.95 groundedness but only 0.72 recall@5. The bottleneck wasn't the LLM or infrastructure — it was retrieval on unstructured, heterogeneous documents where flat chunking severed legal reasoning.
+Legal GraphRAG is the on-premise answer to that specific problem. Built for structured legal corpora with explicit citation graphs, it achieves 0.93 macro recall@10 using structure-aware chunking, deterministic intent routing, and native PostgreSQL graph traversal — on a single node, CPU-only, no external APIs.
 
-On-premise CPU-only. No external APIs. Production-ready evaluation with bootstrap confidence intervals.
 
 ---
 
